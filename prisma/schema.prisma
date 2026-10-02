@@ -1,0 +1,1016 @@
+// ============================================================================
+// AENEWS SOUND — schema.prisma v1.1.0 (RUNTIME SQLite)
+// Adaptation mécanique du contrat PostgreSQL validé :
+//   aenews-sound/prisma/schema.prisma (43 modèles / 42 enums — source de vérité)
+// Différences imposées par SQLite :
+//   - enums -> String (valeurs autorisées documentées en commentaire)
+//   - Json  -> String (texte JSON)
+//   - Decimal -> Float ; pas d'attributs @db.*
+//   - partitionnement mensuel PlaybackEvent : production uniquement (DDL SQL fourni)
+// Règles métier inchangées :
+//   R1: Payment ≠ droit d'accès — seul Entitlement débloque streaming/offline
+//   R2: PlaybackEvent → Fraude → ValidatedListening (>=30s) → RoyaltyLine → Payout
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// IDENTITY
+// ============================================================================
+
+model User {
+  id           String    @id @default(cuid())
+  phone        String    @unique // E.164 — authentification principale
+  email        String?   @unique
+  passwordHash String? // scrypt: salt:hash
+  displayName  String
+  avatarUrl    String?
+  role         String    @default("USER") // USER|ARTIST|MODERATOR|ADMIN|SUPER_ADMIN
+  status       String    @default("ACTIVE") // ACTIVE|PENDING|SUSPENDED|BANNED|DELETED
+  locale       String    @default("fr")
+  country      String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  devices             UserDevice[]
+  sessions            UserSession[]
+  pushTokens          PushToken[]
+  artistMemberships   ArtistMember[]              @relation("ArtistMembership")
+  ownedPlaylists      Playlist[]
+  playlistAdditions   PlaylistTrack[]
+  favorites           Favorite[]
+  follows             Follow[]
+  listeningHistory    ListeningHistory[]
+  playbackSessions    PlaybackSession[]
+  downloads           Download[]
+  payments            Payment[]
+  entitlements        Entitlement[]               @relation("EntitlementOwner")
+  grantedEntitlements Entitlement[]               @relation("EntitlementGrantedBy")
+  idempotencyKeys     IdempotencyKey[]
+  payoutMethods       PayoutMethod[]
+  payoutsReceived     Payout[]
+  statements          Statement[]
+  fraudReviews        FraudReview[]
+  uploadedAssets      AudioAsset[]
+  reportedModerations ModerationReport[]          @relation("ModerationReporter")
+  assignedModerations ModerationReport[]          @relation("ModerationAssignee")
+  auditActions        AuditLog[]
+  featureFlagUpdates  FeatureFlag[]               @relation("FeatureFlagUpdatedBy")
+  externalConnections ExternalAccountConnection[]
+}
+
+// ============================================================================
+// EXTERNAL PROVIDERS — Spotify, Apple Music, YouTube Music, Deezer, Audiomack…
+// Architecture multi-fournisseurs : le cœur AENEWS ne dépend d'aucun provider.
+// Règle absolue : un provider externe fournit des MÉTADONNÉES / identités /
+// liens — jamais de l'audio. L'audio diffusé reste celui du pipeline AENEWS.
+// ============================================================================
+
+// Registre des fournisseurs externes connectés à la plateforme.
+// sandbox=true ⇒ adaptateur de développement clairement identifié (pas d'appel
+// réseau réel) ; production ⇒ identités/credentials via variables d'env.
+model ExternalProviderConfig {
+  id          String   @id @default(cuid())
+  provider    String   @unique // SPOTIFY|APPLE_MUSIC|YOUTUBE_MUSIC|DEEZER|AUDIOMACK
+  displayName String
+  enabled     Boolean  @default(false)
+  sandbox     Boolean  @default(true) // true = adaptateur sandbox identifié, pas la prod
+  settings    String? // JSON {searchTypes, ttlOverrides, redirectUri…}
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  identities  ExternalCatalogIdentity[]
+  connections ExternalAccountConnection[]
+  syncJobs    ExternalSyncJob[]
+}
+
+// Identité externe polymorphe : relie un objet AENEWS (Artist/Album/Track) à
+// l'objet équivalent chez un fournisseur. Un objet AENEWS peut avoir PLUSIEURS
+// fournisseurs ; (provider, entityType, externalId) unique ⇒ anti-doublon.
+model ExternalCatalogIdentity {
+  id             String    @id @default(cuid())
+  providerId     String
+  entityType     String // ARTIST|ALBUM|TRACK
+  entityId       String // id interne AENEWS (jamais confondu avec externalId)
+  externalId     String // id chez le fournisseur (ex: id Spotify)
+  externalUrl    String? // deep link (ex: https://open.spotify.com/…)
+  metadata       String? // JSON — snapshot normalisé du fournisseur
+  lastSyncedAt   DateTime?
+  lastSyncStatus String    @default("NEVER") // NEVER|OK|FAILED
+  lastSyncError  String?
+  createdById    String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  provider         ExternalProviderConfig @relation(fields: [providerId], references: [id])
+  externalSyncJobs ExternalSyncJob[]
+
+  @@unique([providerId, entityType, entityId])
+  @@unique([providerId, entityType, externalId])
+  @@index([entityType, entityId])
+  @@index([externalId])
+}
+
+// Connexion du compte Spotify (ou autre provider) d'un UTILISATEUR.
+// Tokens chiffrés AES-256-GCM au repos — JAMAIS exposés au frontend.
+model ExternalAccountConnection {
+  id                  String    @id @default(cuid())
+  userId              String
+  providerId          String
+  externalAccountId   String
+  externalDisplayName String?
+  accessTokenEnc      String // AES-256-GCM
+  refreshTokenEnc     String?
+  scopes              String?
+  expiresAt           DateTime?
+  sandbox             Boolean   @default(false)
+  connectedAt         DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  user     User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider ExternalProviderConfig @relation(fields: [providerId], references: [id])
+
+  @@unique([userId, providerId])
+  @@index([providerId, externalAccountId])
+}
+
+// File de synchronisation — idempotente, reprenable, observable.
+// La sync ne supprime JAMAIS une donnée AENEWS (ajout/mise à jour only).
+model ExternalSyncJob {
+  id         String    @id @default(cuid())
+  providerId String
+  identityId String?
+  entityType String // ARTIST|ALBUM|TRACK
+  entityId   String
+  operation  String    @default("REFRESH_METADATA") // REFRESH_METADATA|VERIFY_LINK
+  status     String    @default("PENDING") // PENDING|RUNNING|DONE|FAILED
+  attempts   Int       @default(0)
+  lastError  String?
+  startedAt  DateTime?
+  finishedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  provider ExternalProviderConfig   @relation(fields: [providerId], references: [id])
+  identity ExternalCatalogIdentity? @relation(fields: [identityId], references: [id])
+
+  @@index([status, createdAt])
+  @@index([providerId, entityType, entityId])
+}
+
+model UserDevice {
+  id              String   @id @default(cuid())
+  userId          String
+  deviceUid       String
+  platform        String // ANDROID|IOS|WEB|PWA
+  model           String?
+  osVersion       String?
+  appVersion      String?
+  fingerprintHash String?
+  isTrusted       Boolean  @default(false)
+  firstSeenAt     DateTime @default(now())
+  lastSeenAt      DateTime @default(now())
+
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessions         UserSession[]
+  pushTokens       PushToken[]
+  playbackSessions PlaybackSession[]
+  downloads        Download[]
+
+  @@unique([userId, deviceUid])
+  @@index([deviceUid])
+  @@index([fingerprintHash])
+}
+
+model UserSession {
+  id              String    @id @default(cuid())
+  userId          String
+  deviceId        String?
+  refreshHash     String    @unique // sha256 du refresh token
+  rotatedFromId   String?   @unique
+  reuseDetectedAt DateTime?
+  ip              String?
+  userAgent       String?
+  issuedAt        DateTime  @default(now())
+  expiresAt       DateTime
+  revokedAt       DateTime?
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device      UserDevice?  @relation(fields: [deviceId], references: [id])
+  rotatedFrom UserSession? @relation("SessionRotation", fields: [rotatedFromId], references: [id])
+  rotatedTo   UserSession? @relation("SessionRotation")
+
+  @@index([userId, expiresAt])
+}
+
+model PushToken {
+  id         String   @id @default(cuid())
+  userId     String
+  deviceId   String
+  platform   String // FCM|APNS
+  token      String   @unique
+  locale     String?  @default("fr")
+  isValid    Boolean  @default(true)
+  lastUsedAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  user   User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device UserDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ============================================================================
+// CATALOG
+// ============================================================================
+
+model Artist {
+  id         String    @id @default(cuid())
+  name       String
+  slug       String    @unique
+  imageUrl   String?
+  status     String    @default("PENDING") // PENDING|ACTIVE|SUSPENDED|REMOVED
+  verifiedAt DateTime?
+  deletedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  profile      ArtistProfile?
+  members      ArtistMember[]
+  albums       Album[]
+  tracks       Track[]
+  credits      TrackArtist[]
+  rights       Right[]
+  royaltyLines RoyaltyLine[]
+  payouts      Payout[]
+  followers    Follow[]
+}
+
+model ArtistMember {
+  id         String    @id @default(cuid())
+  artistId   String
+  userId     String?
+  memberName String
+  role       String?
+  shareBps   Int       @default(0) // somme = 10000 validée applicatif
+  joinedAt   DateTime  @default(now())
+  leftAt     DateTime?
+
+  artist Artist @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  user   User?  @relation("ArtistMembership", fields: [userId], references: [id])
+
+  @@index([artistId])
+  @@index([userId])
+}
+
+model ArtistProfile {
+  artistId       String   @id
+  bio            String?
+  socials        String? // JSON
+  pressKitUrl    String?
+  managerContact String?
+  updatedAt      DateTime @updatedAt
+
+  artist Artist @relation(fields: [artistId], references: [id], onDelete: Cascade)
+}
+
+model Album {
+  id          String    @id @default(cuid())
+  artistId    String
+  title       String
+  slug        String    @unique
+  type        String    @default("ALBUM") // ALBUM|EP|SINGLE|MIXTAPE
+  releaseDate DateTime?
+  upc         String?   @unique
+  description String?
+  status      String    @default("DRAFT") // DRAFT|PENDING_REVIEW|IN_REVIEW|APPROVED|PUBLISHED|BLOCKED|REMOVED|ARCHIVED
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  artist Artist  @relation(fields: [artistId], references: [id])
+  tracks Track[]
+
+  @@index([artistId, type])
+  @@index([status, publishedAt])
+}
+
+model Track {
+  id              String    @id @default(cuid())
+  mainArtistId    String
+  albumId         String?
+  title           String
+  slug            String    @unique
+  trackNumber     Int?
+  durationSeconds Int
+  isrc            String?   @unique
+  explicit        Boolean   @default(false)
+  status          String    @default("DRAFT") // DRAFT|PENDING_REVIEW|IN_REVIEW|APPROVED|PUBLISHED|BLOCKED|REMOVED|ARCHIVED
+  publishedAt     DateTime?
+  playCount       BigInt    @default(0)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  mainArtist          Artist               @relation(fields: [mainArtistId], references: [id])
+  album               Album?               @relation(fields: [albumId], references: [id])
+  credits             TrackArtist[]
+  genres              TrackGenre[]
+  audioAssets         AudioAsset[]
+  rights              Right[]
+  favorites           Favorite[]
+  playlistTracks      PlaylistTrack[]
+  history             ListeningHistory[]
+  sessions            PlaybackSession[]
+  downloads           Download[]
+  validatedListenings ValidatedListening[]
+  royaltyLines        RoyaltyLine[]
+
+  @@index([mainArtistId])
+  @@index([status, publishedAt])
+}
+
+model TrackArtist {
+  id       String @id @default(cuid())
+  trackId  String
+  artistId String
+  role     String @default("LEAD") // LEAD|FEATURED|PRODUCER|WRITER
+  position Int    @default(0)
+  shareBps Int    @default(0)
+
+  track  Track  @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  artist Artist @relation(fields: [artistId], references: [id])
+
+  @@unique([trackId, artistId, role])
+  @@index([artistId])
+}
+
+model Genre {
+  id            String       @id @default(cuid())
+  name          String       @unique
+  slug          String       @unique
+  description   String?
+  parentGenreId String?
+  parent        Genre?       @relation("GenreTree", fields: [parentGenreId], references: [id])
+  children      Genre[]      @relation("GenreTree")
+  tracks        TrackGenre[]
+}
+
+model TrackGenre {
+  trackId String
+  genreId String
+
+  track Track @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  genre Genre @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@id([trackId, genreId])
+}
+
+// ============================================================================
+// LIBRARY
+// ============================================================================
+
+model Playlist {
+  id          String    @id @default(cuid())
+  ownerId     String?
+  kind        String    @default("USER") // USER|EDITORIAL|SYSTEM
+  title       String
+  description String?
+  coverUrl    String?
+  isPublic    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  owner  User?           @relation(fields: [ownerId], references: [id])
+  tracks PlaylistTrack[]
+
+  @@index([ownerId, isPublic])
+}
+
+model PlaylistTrack {
+  id         String   @id @default(cuid())
+  playlistId String
+  trackId    String
+  position   Int
+  addedById  String?
+  addedAt    DateTime @default(now())
+
+  playlist Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  track    Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  addedBy  User?    @relation(fields: [addedById], references: [id])
+
+  @@unique([playlistId, trackId])
+  @@index([playlistId, position])
+}
+
+model Favorite {
+  id        String   @id @default(cuid())
+  userId    String
+  trackId   String
+  createdAt DateTime @default(now())
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  track Track @relation(fields: [trackId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, trackId])
+  @@index([trackId])
+}
+
+model Follow {
+  id        String   @id @default(cuid())
+  userId    String
+  artistId  String
+  createdAt DateTime @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  artist Artist @relation(fields: [artistId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, artistId])
+  @@index([artistId])
+}
+
+model ListeningHistory {
+  id       String   @id @default(cuid())
+  userId   String
+  trackId  String
+  playedAt DateTime @default(now())
+  context  String? // HOME|SEARCH|PLAYLIST|ALBUM|ARTIST|RADIO|QUEUE|OFFLINE|SHARE
+  deviceId String?
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  track Track @relation(fields: [trackId], references: [id], onDelete: Cascade)
+
+  @@index([userId, playedAt])
+}
+
+// ============================================================================
+// PLAYBACK & EVENTS
+// ============================================================================
+
+model PlaybackSession {
+  id          String    @id @default(cuid())
+  userId      String
+  deviceId    String
+  trackId     String
+  startedAt   DateTime  @default(now())
+  endedAt     DateTime?
+  context     String?
+  appVersion  String?
+  networkType String? // WIFI|CELLULAR_2G|CELLULAR_3G|CELLULAR_4G|CELLULAR_5G|OFFLINE|UNKNOWN
+  country     String?
+
+  user   User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device UserDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  track  Track      @relation(fields: [trackId], references: [id])
+
+  @@index([userId, startedAt])
+  @@index([deviceId, startedAt])
+  @@index([trackId])
+}
+
+/// Event store — partitionné mensuellement en production (DDL SQL fourni).
+/// PK composite (id, occurredAt) : exigence PostgreSQL pour table partitionnée.
+/// Pas de FK volontairement (inserts batchés massifs).
+model PlaybackEvent {
+  id              String   @default(uuid())
+  kind            String // PLAY_START|PLAY_PROGRESS|PLAY_END|BUFFER_STALL|SEEK|QUALITY_CHANGE|SKIP|COMPLETE
+  occurredAt      DateTime
+  sessionId       String?
+  userId          String?
+  trackId         String?
+  deviceId        String?
+  positionSeconds Int?
+  durationSeconds Int?
+  bufferedMs      Int?
+  bitrateKbps     Int?
+  variant         String?
+  networkType     String?
+  devicePlatform  String? // ANDROID|IOS|WEB|PWA
+  appVersion      String?
+  country         String?
+  isOffline       Boolean  @default(false)
+  clientBatchId   String?
+  createdAt       DateTime @default(now())
+
+  @@id([id, occurredAt])
+  @@index([trackId, occurredAt])
+  @@index([userId, occurredAt])
+  @@index([occurredAt])
+}
+
+/// Pont immutable Playback → Royalties. 1 ligne = 1 écoute comptabilisée
+/// (>= 30s, dédupliquée par sessionId:trackId, post-filtrage antifraude).
+model ValidatedListening {
+  id               String   @id @default(cuid())
+  dedupeKey        String   @unique
+  trackId          String
+  userId           String?
+  sessionId        String?
+  deviceId         String?
+  playedSeconds    Int
+  thresholdSeconds Int      @default(30)
+  listenedAt       DateTime
+  context          String?
+  country          String?
+  fraudFlagId      String?
+  createdAt        DateTime @default(now())
+
+  track Track @relation(fields: [trackId], references: [id])
+
+  @@index([trackId, listenedAt])
+  @@index([listenedAt])
+}
+
+model Download {
+  id               String    @id @default(cuid())
+  userId           String
+  deviceId         String
+  trackId          String
+  entitlementId    String?
+  status           String    @default("REQUESTED") // REQUESTED|PREPARING|READY|FAILED|EXPIRED|REVOKED
+  licenseExpiresAt DateTime?
+  lastValidatedAt  DateTime?
+  revokedAt        DateTime?
+  sizeBytes        BigInt?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device      UserDevice   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  track       Track        @relation(fields: [trackId], references: [id])
+  entitlement Entitlement? @relation(fields: [entitlementId], references: [id])
+
+  @@unique([userId, deviceId, trackId])
+  @@index([trackId])
+}
+
+// ============================================================================
+// PAYMENTS & ENTITLEMENTS
+// ============================================================================
+
+model PaymentProvider {
+  id          String   @id @default(cuid())
+  code        String   @unique // FLEXPAY|CINETPAY|FLUTTERWAVE|MAXICASH|SANDBOX
+  displayName String
+  isActive    Boolean  @default(true)
+  testMode    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  payments      Payment[]
+  webhookEvents WebhookEvent[]
+}
+
+/// Packs prépayés mobile money : PAS de débit récurrent automatique.
+model SubscriptionPlan {
+  id                   String   @id @default(cuid())
+  code                 String   @unique
+  name                 String
+  description          String?
+  durationHours        Int
+  priceMinor           BigInt
+  currency             String   @default("CDF")
+  offlineDownloadLimit Int?
+  maxDevices           Int      @default(2)
+  features             String? // JSON
+  isActive             Boolean  @default(true)
+  sortOrder            Int      @default(0)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  payments     Payment[]
+  entitlements Entitlement[]
+}
+
+/// Ne confère AUCUN droit : le webhook SUCCEEDED crée l'Entitlement (R1).
+model Payment {
+  id               String    @id @default(cuid())
+  userId           String
+  planId           String
+  providerId       String
+  providerRef      String?
+  amountMinor      BigInt
+  currency         String
+  phoneNumber      String
+  status           String    @default("INITIATED") // INITIATED|AWAITING_USSD|PENDING|SUCCEEDED|FAILED|EXPIRED|CANCELLED|REFUNDED
+  statusReason     String?
+  idempotencyKeyId String?   @unique
+  expiresAt        DateTime?
+  metadata         String? // JSON
+  initiatedAt      DateTime  @default(now())
+  completedAt      DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  user           User             @relation(fields: [userId], references: [id])
+  plan           SubscriptionPlan @relation(fields: [planId], references: [id])
+  provider       PaymentProvider  @relation(fields: [providerId], references: [id])
+  idempotencyKey IdempotencyKey?  @relation(fields: [idempotencyKeyId], references: [id])
+  webhookEvents  WebhookEvent[]
+  entitlements   Entitlement[]
+
+  @@unique([providerId, providerRef])
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+}
+
+model WebhookEvent {
+  id              String    @id @default(cuid())
+  providerId      String
+  providerEventId String
+  eventType       String
+  signatureValid  Boolean   @default(false)
+  payload         String // JSON brut
+  status          String    @default("RECEIVED") // RECEIVED|PROCESSING|PROCESSED|FAILED|IGNORED|DUPLICATE
+  error           String?
+  paymentId       String?
+  receivedAt      DateTime  @default(now())
+  processedAt     DateTime?
+
+  provider PaymentProvider @relation(fields: [providerId], references: [id])
+  payment  Payment?        @relation(fields: [paymentId], references: [id])
+
+  @@unique([providerId, providerEventId])
+  @@index([status])
+}
+
+model IdempotencyKey {
+  id             String   @id @default(cuid())
+  key            String   @unique
+  userId         String?
+  endpoint       String
+  requestHash    String
+  responseStatus Int?
+  responseBody   String? // JSON
+  status         String   @default("OPEN") // OPEN|COMPLETED|CONFLICT
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+
+  user     User?     @relation(fields: [userId], references: [id])
+  payments Payment[]
+
+  @@index([expiresAt])
+}
+
+/// SOURCE UNIQUE DE VÉRITÉ d'accès (R1). Packs cumulables.
+model Entitlement {
+  id           String    @id @default(cuid())
+  userId       String
+  planId       String?
+  paymentId    String?
+  grantedById  String?
+  source       String // PACK_PAYMENT|GIFT|ADMIN_GRANT|TRIAL|REFERRAL
+  status       String    @default("ACTIVE") // ACTIVE|EXPIRED|REVOKED
+  startsAt     DateTime  @default(now())
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  revokeReason String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  user      User              @relation("EntitlementOwner", fields: [userId], references: [id])
+  plan      SubscriptionPlan? @relation(fields: [planId], references: [id])
+  payment   Payment?          @relation(fields: [paymentId], references: [id])
+  grantedBy User?             @relation("EntitlementGrantedBy", fields: [grantedById], references: [id])
+  downloads Download[]
+
+  @@index([userId, status, expiresAt])
+}
+
+// ============================================================================
+// RIGHTS
+// ============================================================================
+
+model Right {
+  id               String    @id @default(cuid())
+  trackId          String
+  holderArtistId   String
+  kind             String // OWNERSHIP|LICENSE
+  licenseType      String? // EXCLUSIVE|NON_EXCLUSIVE
+  counterparty     String?
+  validFrom        DateTime  @default(now())
+  validUntil       DateTime?
+  streamingAllowed Boolean   @default(true)
+  downloadAllowed  Boolean   @default(false)
+  status           String    @default("DRAFT") // DRAFT|ACTIVE|SUSPENDED|EXPIRED|TERMINATED|DISPUTED
+  notes            String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  track    Track     @relation(fields: [trackId], references: [id])
+  holder   Artist    @relation(fields: [holderArtistId], references: [id])
+  licenses License[]
+
+  @@index([trackId, status])
+}
+
+model Territory {
+  code String @id // ISO 3166-1 alpha-2
+  name String
+
+  licenses License[]
+}
+
+model License {
+  id               String    @id @default(cuid())
+  rightId          String
+  territoryCode    String
+  streamingAllowed Boolean   @default(true)
+  downloadAllowed  Boolean   @default(false)
+  feeMinor         BigInt?
+  currency         String?
+  validFrom        DateTime  @default(now())
+  validUntil       DateTime?
+  status           String    @default("ACTIVE") // DRAFT|ACTIVE|SUSPENDED|EXPIRED|TERMINATED|DISPUTED
+
+  right     Right     @relation(fields: [rightId], references: [id], onDelete: Cascade)
+  territory Territory @relation(fields: [territoryCode], references: [code])
+
+  @@unique([rightId, territoryCode])
+}
+
+// ============================================================================
+// ROYALTIES — LEDGER IMMUTABLE
+// ============================================================================
+
+model RoyaltyPeriod {
+  id             String    @id @default(cuid())
+  periodStart    DateTime
+  periodEnd      DateTime
+  status         String    @default("OPEN") // OPEN|CALCULATING|CLOSED|PAYOUT_IN_PROGRESS|PAID|PARTIALLY_PAID
+  payoutDeadline DateTime?
+  notes          String?
+  closedAt       DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  lines      RoyaltyLine[]
+  payouts    Payout[]
+  statements Statement[]
+
+  @@unique([periodStart, periodEnd])
+}
+
+/// LEDGER APPEND-ONLY. Correction = REVERSAL + nouvelle ENTRY.
+model RoyaltyLine {
+  id                      String   @id @default(cuid())
+  periodId                String
+  type                    String   @default("ENTRY") // ENTRY|REVERSAL|ADJUSTMENT
+  reversalOfId            String?  @unique
+  trackId                 String
+  artistId                String
+  validatedListeningCount Int
+  grossAmountMinor        BigInt
+  shareBps                Int
+  netAmountMinor          BigInt
+  currency                String   @default("CDF")
+  sourceDigest            String? // JSON (audit)
+  note                    String?
+  createdAt               DateTime @default(now())
+
+  period     RoyaltyPeriod @relation(fields: [periodId], references: [id])
+  track      Track         @relation(fields: [trackId], references: [id])
+  artist     Artist        @relation(fields: [artistId], references: [id])
+  reversalOf RoyaltyLine?  @relation("RoyaltyReversal", fields: [reversalOfId], references: [id])
+  reversedBy RoyaltyLine?  @relation("RoyaltyReversal")
+
+  @@index([periodId, artistId])
+  @@index([artistId])
+  @@index([trackId])
+}
+
+model PayoutMethod {
+  id          String    @id @default(cuid())
+  userId      String
+  type        String    @default("MOBILE_MONEY") // MOBILE_MONEY|BANK
+  mmProvider  String? // VODACOM_MPESA|ORANGE_MONEY|AIRTEL_MONEY
+  phoneNumber String
+  holderName  String
+  isDefault   Boolean   @default(false)
+  verifiedAt  DateTime?
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  payouts Payout[]
+
+  @@index([userId])
+}
+
+model Payout {
+  id             String    @id @default(cuid())
+  periodId       String
+  payeeUserId    String
+  artistId       String?
+  payoutMethodId String
+  amountMinor    BigInt
+  currency       String
+  status         String    @default("PENDING") // PENDING|APPROVED|PROCESSING|SENT|CONFIRMED|FAILED|CANCELLED
+  providerRef    String?
+  failureReason  String?
+  initiatedAt    DateTime?
+  sentAt         DateTime?
+  confirmedAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  period RoyaltyPeriod @relation(fields: [periodId], references: [id])
+  payee  User          @relation(fields: [payeeUserId], references: [id])
+  artist Artist?       @relation(fields: [artistId], references: [id])
+  method PayoutMethod  @relation(fields: [payoutMethodId], references: [id])
+
+  @@index([periodId])
+  @@index([payeeUserId, status])
+}
+
+model Statement {
+  id             String    @id @default(cuid())
+  periodId       String
+  payeeUserId    String
+  fileKey        String // storage privé
+  totalDueMinor  BigInt
+  currency       String
+  generatedAt    DateTime  @default(now())
+  acknowledgedAt DateTime?
+
+  period RoyaltyPeriod @relation(fields: [periodId], references: [id])
+  payee  User          @relation(fields: [payeeUserId], references: [id])
+
+  @@unique([periodId, payeeUserId])
+}
+
+// ============================================================================
+// FRAUD
+// ============================================================================
+
+model FraudFlag {
+  id               String    @id @default(cuid())
+  subjectType      String // USER|DEVICE|SESSION|TRACK|ARTIST
+  subjectId        String
+  rule             String // IMPOSSIBLE_PLAYBACK|BOT_BEHAVIOR|REPEATED_LOOPS|DEVICE_ANOMALY|ACCOUNT_CLUSTER|ABNORMAL_SESSION|VELOCITY_ANOMALY
+  severity         String    @default("LOW") // LOW|MEDIUM|HIGH|CRITICAL
+  score            Float?
+  evidence         String? // JSON
+  status           String    @default("OPEN") // OPEN|AUTO_CONFIRMED|CONFIRMED|DISMISSED
+  relatedUserId    String?
+  relatedSessionId String?
+  detectedAt       DateTime  @default(now())
+  reviewedAt       DateTime?
+  resolvedAt       DateTime?
+
+  reviews FraudReview[]
+
+  @@index([subjectType, subjectId])
+  @@index([status, severity])
+}
+
+model FraudReview {
+  id         String   @id @default(cuid())
+  flagId     String
+  reviewerId String
+  decision   String // CONFIRM|DISMISS|ESCALATE
+  note       String?
+  createdAt  DateTime @default(now())
+
+  flag     FraudFlag @relation(fields: [flagId], references: [id], onDelete: Cascade)
+  reviewer User      @relation(fields: [reviewerId], references: [id])
+
+  @@index([flagId])
+}
+
+// ============================================================================
+// MEDIA
+// ============================================================================
+
+model AudioAsset {
+  id               String   @id @default(cuid())
+  trackId          String
+  kind             String // MASTER|DERIVED
+  storageKey       String
+  originalFilename String?
+  mimeType         String
+  sizeBytes        BigInt
+  sha256           String
+  durationSeconds  Int?
+  sampleRate       Int?
+  bitrateKbps      Int?
+  loudnessLufs     Float?
+  metadata         String? // JSON
+  status           String   @default("UPLOADED") // UPLOADED|VALIDATING|PROCESSING|READY|FAILED|QUARANTINED
+  uploadedById     String?
+  error            String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  track      Track          @relation(fields: [trackId], references: [id])
+  uploadedBy User?          @relation(fields: [uploadedById], references: [id])
+  variants   MediaVariant[]
+
+  @@index([trackId])
+  @@index([sha256])
+}
+
+model MediaVariant {
+  id             String    @id @default(cuid())
+  assetId        String
+  kind           String // HLS_64K|HLS_128K|HLS_256K|PROGRESSIVE_128K|OPUS_96K|WAVEFORM
+  codec          String // AAC_LC|HE_AAC|OPUS|MP3|PCM
+  deliveryFormat String // HLS|PROGRESSIVE|WAVEFORM_JSON
+  storageKey     String
+  bitrateKbps    Int?
+  segmentSeconds Int?
+  sizeBytes      BigInt?
+  checksum       String?
+  status         String    @default("PROCESSING") // UPLOADED|VALIDATING|PROCESSING|READY|FAILED|QUARANTINED
+  readyAt        DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  asset AudioAsset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@unique([assetId, kind])
+}
+
+model Artwork {
+  id         String   @id @default(cuid())
+  ownerType  String // ALBUM|TRACK|PLAYLIST|ARTIST|USER
+  ownerId    String
+  storageKey String
+  width      Int
+  height     Int
+  sizeBytes  BigInt?
+  blurhash   String?
+  isPrimary  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@index([ownerType, ownerId, isPrimary])
+}
+
+// ============================================================================
+// GOVERNANCE
+// ============================================================================
+
+model ModerationReport {
+  id             String    @id @default(cuid())
+  subjectType    String // TRACK|ALBUM|ARTWORK|ARTIST|USER|PLAYLIST
+  subjectId      String
+  reason         String // COPYRIGHT|EXPLICIT_CONTENT|QUALITY|IMPOSTER|SPAM|OTHER
+  details        String?
+  reporterId     String?
+  assignedToId   String?
+  status         String    @default("PENDING") // PENDING|IN_REVIEW|RESOLVED|REJECTED
+  outcome        String? // APPROVED|TAKEDOWN|NO_ACTION
+  resolutionNote String?
+  createdAt      DateTime  @default(now())
+  resolvedAt     DateTime?
+
+  reporter   User? @relation("ModerationReporter", fields: [reporterId], references: [id])
+  assignedTo User? @relation("ModerationAssignee", fields: [assignedToId], references: [id])
+
+  @@index([status, createdAt])
+  @@index([subjectType, subjectId])
+}
+
+/// APPEND-ONLY.
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String
+  before     String? // JSON
+  after      String? // JSON
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  actor User? @relation(fields: [actorId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+  @@index([action])
+}
+
+model FeatureFlag {
+  id             String   @id @default(cuid())
+  key            String   @unique
+  description    String?
+  enabled        Boolean  @default(false)
+  rolloutPercent Int      @default(0)
+  audience       String? // JSON
+  updatedById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  updatedBy User? @relation("FeatureFlagUpdatedBy", fields: [updatedById], references: [id])
+}
