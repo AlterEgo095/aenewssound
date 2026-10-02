@@ -80,3 +80,19 @@ Stage Summary:
 - Procédure de bascule documentée dans .env : décommenter SPOTIFY_CLIENT_ID/SECRET → redémarrer → registry bascule automatiquement sandbox→réel (aucun changement de code, cache TTL/rate limiter/retries déjà en place)
 - scripts/spotify-token-check.ts : outil de vérification réutilisable (VPS deploiement) — auth + recherche réelle « Fally Ipupa », exit codes distincts par panne
 - Leçon d'ingénierie enregistrée : ne JAMAIS saisir un ID/secret depuis une capture d'écran (police Spotify : f/1, c/e, 6/d confondables) ; toujours copier-coller texte + rotation en cas de doute
+
+---
+Task ID: 5
+Agent: main (Z.ai Code)
+Task: Déploiement du code sur github.com/AlterEgo095/aenewssound avec protocole anti-fuite de secrets
+
+Work Log:
+- Audit pré-push : découvert que .env (creds Spotify), db/custom.db, db/storage (audio/artworks), 4 captures d'écran upload/ (dont une avec secret affiché) et tool-results/ étaient TRACKÉS — le .gitignore ne s'applique pas aux fichiers déjà committs
+- Décisif : git log -S a trouvé le secret Spotify ACTIF (dd4a8f2a…) dans l'historique local (commits f241b49, 6e201de) — un push direct l'aurait livré à GitHub
+- Protocole appliqué : untrack (.env, db/, upload/, download/, tool-results/) → .gitignore étendu → vérification git grep --cached (0 secret dans l'arbre) → commit ORPHAN unique (history UUID du sandbox écartée) → force-push → reflog expire + gc --prune=now (purge locale définitive)
+- Vérifié : ls-remote HEAD = local HEAD = c520aca ; origin configuré SANS token ; token GitHub utilisé inline uniquement (jamais écrit sur disque)
+
+Stage Summary:
+- github.com/AlterEgo095/aenewssound = 1 commit propre (c520aca), ~136 fichiers, zéro secret, zéro binaire runtime
+- Recommandations transmises : rotation du PAT GitHub (passé en clair dans le chat), rotation du secret Spotify en hygiène (visible sur capture du chat mais jamais poussé)
+- Déploiement VPS possible : git clone du repo + .env à recréer (jamais dans Git, par design)
