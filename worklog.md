@@ -96,3 +96,17 @@ Stage Summary:
 - github.com/AlterEgo095/aenewssound = 1 commit propre (c520aca), ~136 fichiers, zéro secret, zéro binaire runtime
 - Recommandations transmises : rotation du PAT GitHub (passé en clair dans le chat), rotation du secret Spotify en hygiène (visible sur capture du chat mais jamais poussé)
 - Déploiement VPS possible : git clone du repo + .env à recréer (jamais dans Git, par design)
+
+---
+Task ID: 6
+Agent: main (Z.ai Code)
+Task: README de dépôt + vérification exhaustive de la synchronisation GitHub
+
+Work Log:
+- Inventaire des variables d'environnement réellement utilisées (grep process.env) pour documenter avec exactitude : DATABASE_URL, AUTH_SECRET, SANDBOX_PROVIDER_SECRET, ROYALTY_RATE_MINOR_PER_STREAM, SPOTIFY_CLIENT_ID/SECRET/REDIRECT_URI
+- README.md écrit (français) : deux règles d'or, tableau des fonctionnalités par domaine, stack, arborescence annotée, démarrage, env vars (sans valeurs), comptes démo, scripts ops, intégration Spotify multi-fournisseurs, tableau sandbox↔production, invariants de sécurité, feuille de route cochable
+- Commit e21a7d5 poussé ; vérification : arbre propre, 179 fichiers trackés = 179 dans HEAD, hash local == hash distant (égalité de hash git = contenu identique garanti)
+
+Stage Summary:
+- Le dépôt github.com/AlterEgo095/aenewssound est la référence documentée du projet (README à jour de l'état réel, y compris le blocage Premium Spotify)
+- Méthode de vérification réutilisable : rev-parse HEAD vs ls-remote (égalité de commit = preuve crypto du contenu identique)
