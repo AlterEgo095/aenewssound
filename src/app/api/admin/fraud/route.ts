@@ -5,6 +5,15 @@ import { audit } from "@/lib/audit";
 
 export const dynamic = "force-dynamic";
 
+function safeParse(raw: string | null): Record<string, unknown> | null {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null; // donnée corrompue : jamais de 500 brut
+  }
+}
+
 export async function GET(req: Request) {
   return handle(async () => {
     await requireAdmin(req);
@@ -21,7 +30,7 @@ export async function GET(req: Request) {
         rule: f.rule,
         severity: f.severity,
         score: f.score,
-        evidence: f.evidence ? (JSON.parse(f.evidence) as Record<string, unknown>) : null,
+        evidence: safeParse(f.evidence),
         status: f.status,
         relatedUserId: f.relatedUserId,
         relatedSessionId: f.relatedSessionId,

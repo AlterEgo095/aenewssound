@@ -336,7 +336,7 @@ export function ExternalView() {
                         title: item.title,
                         artistName: null,
                       });
-                      setMode(item.linked ? "LINK" : "LINK");
+                      setMode(item.linked ? "LINK" : "CREATE");
                       setLinkedTarget(null);
                       setCreateArtistId(null);
                     }}
@@ -401,6 +401,7 @@ export function ExternalView() {
                   variant="outline"
                   className="h-7 border-zinc-700"
                   onClick={() => resync.mutate(identity.id)}
+                  aria-label={`Resynchroniser ${identity.entityType} ${identity.entityLabel ?? identity.externalId}`}
                 >
                   <RefreshCw className="h-3 w-3" />
                 </Button>
@@ -420,6 +421,7 @@ export function ExternalView() {
                   variant="outline"
                   className="h-7 border-rose-500/40 text-rose-400"
                   onClick={() => detach.mutate(identity.id)}
+                  aria-label={`Dissocier ${identity.entityType} ${identity.entityLabel ?? identity.externalId}`}
                 >
                   <Link2Off className="h-3 w-3" />
                 </Button>

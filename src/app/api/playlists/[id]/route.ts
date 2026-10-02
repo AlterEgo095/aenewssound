@@ -36,7 +36,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     await getOwnedPlaylist(id, user.id);
     const body = await parseBody<{ trackId?: string }>(req);
     const trackId = requireString(body.trackId, "trackId");
-    const track = await db.track.findFirst({ where: { id: trackId, deletedAt: null } });
+    const track = await db.track.findFirst({ where: { id: trackId, status: "PUBLISHED", deletedAt: null } });
     if (!track) throw new ApiError(404, "Titre introuvable");
 
     const last = await db.playlistTrack.findFirst({

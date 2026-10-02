@@ -210,42 +210,57 @@ export async function executeImport(input: {
   }
 
   // --- CREATE : création contrôlée de métadonnées (jamais d'audio externe) ---
+  // Garde ANTI-DOUBLON enforcement : le preview informe l'UI, mais l'exécution
+  // re-vérifie — un objet externe déjà lié à une entité AENEWS ne peut pas
+  // créer une seconde entité (sinon entité orpheline + P2002 en milieu de route).
+  if (preview.existingIdentity) {
+    throw new ApiError(
+      409,
+      `EXTERNAL_ALREADY_LINKED : ce ${input.entityType} externe est déjà associé à une entité AENEWS`,
+      "EXTERNAL_ALREADY_LINKED"
+    );
+  }
   const meta = preview.metadata;
 
   if (input.entityType === "ARTIST") {
     const name = String(meta.name ?? "").trim();
     if (!name) throw new ApiError(400, "Nom d'artiste manquant dans les métadonnées");
     const slug = await uniqueSlug(name);
-    const artist = await db.artist.create({
-      data: {
-        name,
-        slug,
-        status: "ACTIVE",
-        verifiedAt: null,
-        profile: { create: { bio: null } },
-      },
-    });
-    const identity = await db.externalCatalogIdentity.create({
-      data: {
-        providerId: input.providerId,
-        entityType: "ARTIST",
-        entityId: artist.id,
-        externalId: input.externalId,
-        externalUrl: preview.externalUrl,
-        metadata: JSON.stringify(meta),
-        lastSyncedAt: new Date(),
-        lastSyncStatus: "OK",
-        createdById: input.actorId,
-      },
+    // TRANSACTION : entité + identité naissent ensemble — aucun état partiel
+    // (artiste orphelin sans identité) en cas d'échec ou de course concurrente.
+    const { entity, identity } = await db.$transaction(async (tx) => {
+      const a = await tx.artist.create({
+        data: {
+          name,
+          slug,
+          status: "ACTIVE",
+          verifiedAt: null,
+          profile: { create: { bio: null } },
+        },
+      });
+      const id = await tx.externalCatalogIdentity.create({
+        data: {
+          providerId: input.providerId,
+          entityType: "ARTIST",
+          entityId: a.id,
+          externalId: input.externalId,
+          externalUrl: preview.externalUrl,
+          metadata: JSON.stringify(meta),
+          lastSyncedAt: new Date(),
+          lastSyncStatus: "OK",
+          createdById: input.actorId,
+        },
+      });
+      return { entity: a, identity: id };
     });
     await audit({
       actorId: input.actorId,
       action: "EXTERNAL_IMPORT_CREATE",
       entityType: "ARTIST",
-      entityId: artist.id,
+      entityId: entity.id,
       after: { provider: input.provider.kind, externalId: input.externalId, slug },
     });
-    return { action: "CREATED", entityId: artist.id, identityId: identity.id };
+    return { action: "CREATED", entityId: entity.id, identityId: identity.id };
   }
 
   if (!input.mainArtistId) {
@@ -257,40 +272,43 @@ export async function executeImport(input: {
     const title = String(meta.title ?? "").trim();
     if (!title) throw new ApiError(400, "Titre d'album manquant dans les métadonnées");
     const slug = await uniqueSlug(title);
-    const album = await db.album.create({
-      data: {
-        artistId: input.mainArtistId,
-        title,
-        slug,
-        type: (["ALBUM", "EP", "SINGLE", "MIXTAPE"] as const).includes(meta.typeHint as "ALBUM")
-          ? ((meta.typeHint as "ALBUM" | "EP" | "SINGLE") ?? "ALBUM")
-          : "ALBUM",
-        releaseDate: typeof meta.releaseDate === "string" ? new Date(meta.releaseDate) : null,
-        upc: typeof meta.upc === "string" && meta.upc ? meta.upc : undefined,
-        status: "DRAFT", // publiera uniquement via modération AENEWS
-      },
-    });
-    const identity = await db.externalCatalogIdentity.create({
-      data: {
-        providerId: input.providerId,
-        entityType: "ALBUM",
-        entityId: album.id,
-        externalId: input.externalId,
-        externalUrl: preview.externalUrl,
-        metadata: JSON.stringify(meta),
-        lastSyncedAt: new Date(),
-        lastSyncStatus: "OK",
-        createdById: input.actorId,
-      },
+    const { entity, identity } = await db.$transaction(async (tx) => {
+      const al = await tx.album.create({
+        data: {
+          artistId: input.mainArtistId!,
+          title,
+          slug,
+          type: (["ALBUM", "EP", "SINGLE", "MIXTAPE"] as const).includes(meta.typeHint as "ALBUM")
+            ? ((meta.typeHint as "ALBUM" | "EP" | "SINGLE") ?? "ALBUM")
+            : "ALBUM",
+          releaseDate: typeof meta.releaseDate === "string" ? new Date(meta.releaseDate) : null,
+          upc: typeof meta.upc === "string" && meta.upc ? meta.upc : undefined,
+          status: "DRAFT", // publiera uniquement via modération AENEWS
+        },
+      });
+      const id = await tx.externalCatalogIdentity.create({
+        data: {
+          providerId: input.providerId,
+          entityType: "ALBUM",
+          entityId: al.id,
+          externalId: input.externalId,
+          externalUrl: preview.externalUrl,
+          metadata: JSON.stringify(meta),
+          lastSyncedAt: new Date(),
+          lastSyncStatus: "OK",
+          createdById: input.actorId,
+        },
+      });
+      return { entity: al, identity: id };
     });
     await audit({
       actorId: input.actorId,
       action: "EXTERNAL_IMPORT_CREATE",
       entityType: "ALBUM",
-      entityId: album.id,
+      entityId: entity.id,
       after: { provider: input.provider.kind, externalId: input.externalId, mainArtistId: input.mainArtistId },
     });
-    return { action: "CREATED", entityId: album.id, identityId: identity.id };
+    return { action: "CREATED", entityId: entity.id, identityId: identity.id };
   }
 
   // TRACK
@@ -301,38 +319,41 @@ export async function executeImport(input: {
     throw new ApiError(400, "Durée invalide dans les métadonnées du titre");
   }
   const slug = await uniqueSlug(title);
-  const track = await db.track.create({
-    data: {
-      mainArtistId: input.mainArtistId,
-      albumId: input.albumId ?? null,
-      title,
-      slug,
-      trackNumber: typeof meta.trackNumber === "number" ? meta.trackNumber : undefined,
-      durationSeconds: Math.round(durationSeconds),
-      isrc: typeof meta.isrc === "string" && meta.isrc ? meta.isrc : undefined,
-      explicit: meta.explicit === true,
-      status: "DRAFT", // audio à uploader via pipeline AENEWS + modération
-    },
-  });
-  const identity = await db.externalCatalogIdentity.create({
-    data: {
-      providerId: input.providerId,
-      entityType: "TRACK",
-      entityId: track.id,
-      externalId: input.externalId,
-      externalUrl: preview.externalUrl,
-      metadata: JSON.stringify(meta),
-      lastSyncedAt: new Date(),
-      lastSyncStatus: "OK",
-      createdById: input.actorId,
-    },
+  const { entity, identity } = await db.$transaction(async (tx) => {
+    const t = await tx.track.create({
+      data: {
+        mainArtistId: input.mainArtistId!,
+        albumId: input.albumId ?? null,
+        title,
+        slug,
+        trackNumber: typeof meta.trackNumber === "number" ? meta.trackNumber : undefined,
+        durationSeconds: Math.round(durationSeconds),
+        isrc: typeof meta.isrc === "string" && meta.isrc ? meta.isrc : undefined,
+        explicit: meta.explicit === true,
+        status: "DRAFT", // audio à uploader via pipeline AENEWS + modération
+      },
+    });
+    const id = await tx.externalCatalogIdentity.create({
+      data: {
+        providerId: input.providerId,
+        entityType: "TRACK",
+        entityId: t.id,
+        externalId: input.externalId,
+        externalUrl: preview.externalUrl,
+        metadata: JSON.stringify(meta),
+        lastSyncedAt: new Date(),
+        lastSyncStatus: "OK",
+        createdById: input.actorId,
+      },
+    });
+    return { entity: t, identity: id };
   });
   await audit({
     actorId: input.actorId,
     action: "EXTERNAL_IMPORT_CREATE",
     entityType: "TRACK",
-    entityId: track.id,
+    entityId: entity.id,
     after: { provider: input.provider.kind, externalId: input.externalId, mainArtistId: input.mainArtistId },
   });
-  return { action: "CREATED", entityId: track.id, identityId: identity.id };
+  return { action: "CREATED", entityId: entity.id, identityId: identity.id };
 }

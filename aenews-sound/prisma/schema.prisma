@@ -378,30 +378,32 @@ model User {
   updatedAt    DateTime   @updatedAt
   deletedAt    DateTime? // soft-delete : les records financiers ne cassent jamais
 
-  devices             UserDevice[]
-  sessions            UserSession[]
-  pushTokens          PushToken[]
-  artistMemberships   ArtistMember[]     @relation("ArtistMembership")
-  ownedPlaylists      Playlist[]
-  playlistAdditions   PlaylistTrack[]
-  favorites           Favorite[]
-  follows             Follow[]
-  listeningHistory    ListeningHistory[]
-  playbackSessions    PlaybackSession[]
-  downloads           Download[]
-  payments            Payment[]
-  entitlements        Entitlement[]      @relation("EntitlementOwner")
-  grantedEntitlements Entitlement[]      @relation("EntitlementGrantedBy")
-  idempotencyKeys     IdempotencyKey[]
-  payoutMethods       PayoutMethod[]
-  payoutsReceived     Payout[]
-  statements          Statement[]
-  fraudReviews        FraudReview[]
-  uploadedAssets      AudioAsset[]
-  reportedModerations ModerationReport[] @relation("ModerationReporter")
-  assignedModerations ModerationReport[] @relation("ModerationAssignee")
-  auditActions        AuditLog[]
-  featureFlagUpdates  FeatureFlag[]      @relation("FeatureFlagUpdatedBy")
+  devices                   UserDevice[]
+  sessions                  UserSession[]
+  pushTokens                PushToken[]
+  artistMemberships         ArtistMember[]              @relation("ArtistMembership")
+  ownedPlaylists            Playlist[]
+  playlistAdditions         PlaylistTrack[]
+  favorites                 Favorite[]
+  follows                   Follow[]
+  listeningHistory          ListeningHistory[]
+  playbackSessions          PlaybackSession[]
+  downloads                 Download[]
+  payments                  Payment[]
+  entitlements              Entitlement[]               @relation("EntitlementOwner")
+  grantedEntitlements       Entitlement[]               @relation("EntitlementGrantedBy")
+  idempotencyKeys           IdempotencyKey[]
+  payoutMethods             PayoutMethod[]
+  payoutsReceived           Payout[]
+  statements                Statement[]
+  fraudReviews              FraudReview[]
+  uploadedAssets            AudioAsset[]
+  reportedModerations       ModerationReport[]          @relation("ModerationReporter")
+  assignedModerations       ModerationReport[]          @relation("ModerationAssignee")
+  auditActions              AuditLog[]
+  featureFlagUpdates        FeatureFlag[]               @relation("FeatureFlagUpdatedBy")
+  externalConnections       ExternalAccountConnection[]
+  createdExternalIdentities ExternalCatalogIdentity[]   @relation("ExternalIdentityCreatedBy")
 }
 
 model UserDevice {
@@ -1286,4 +1288,136 @@ model FeatureFlag {
   updatedAt      DateTime @updatedAt
 
   updatedBy User? @relation("FeatureFlagUpdatedBy", fields: [updatedById], references: [id])
+}
+
+// ============================================================================
+// EXTERNAL PROVIDERS — Spotify, Apple Music, YouTube Music, Deezer, Audiomack…
+// Architecture multi-fournisseurs : le cœur AENEWS ne dépend d'aucun provider.
+// Règle absolue : un provider externe fournit des MÉTADONNÉES / identités /
+// liens — jamais de l'audio. L'audio diffusé reste celui du pipeline AENEWS.
+// (Ajouté au contrat v1.1 — aligné sur le runtime, audit F2.)
+// ============================================================================
+
+enum ExternalProviderKind {
+  SPOTIFY
+  APPLE_MUSIC
+  YOUTUBE_MUSIC
+  DEEZER
+  AUDIOMACK
+}
+
+enum ExternalEntityType {
+  ARTIST
+  ALBUM
+  TRACK
+}
+
+enum ExternalSyncStatus {
+  NEVER
+  OK
+  FAILED
+}
+
+enum ExternalSyncOperation {
+  REFRESH_METADATA
+  VERIFY_LINK
+}
+
+enum ExternalSyncJobStatus {
+  PENDING
+  RUNNING
+  DONE
+  FAILED
+}
+
+// Registre des fournisseurs externes connectés à la plateforme.
+// sandbox=true ⇒ adaptateur de développement clairement identifié (pas d'appel
+// réseau réel) ; production ⇒ identités/credentials via variables d'env.
+model ExternalProviderConfig {
+  id          String               @id @default(cuid())
+  provider    ExternalProviderKind @unique
+  displayName String
+  enabled     Boolean              @default(false)
+  sandbox     Boolean              @default(true) // true = adaptateur sandbox identifié
+  settings    Json? // {searchTypes, ttlOverrides, redirectUri…}
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+
+  identities  ExternalCatalogIdentity[]
+  connections ExternalAccountConnection[]
+  syncJobs    ExternalSyncJob[]
+}
+
+// Identité externe polymorphe : relie un objet AENEWS (Artist/Album/Track) à
+// l'objet équivalent chez un fournisseur. Un objet AENEWS peut avoir PLUSIEURS
+// fournisseurs ; (provider, entityType, externalId) unique ⇒ anti-doublon.
+model ExternalCatalogIdentity {
+  id             String             @id @default(cuid())
+  providerId     String
+  entityType     ExternalEntityType
+  entityId       String // id interne AENEWS (jamais confondu avec externalId)
+  externalId     String // id chez le fournisseur (ex: id Spotify)
+  externalUrl    String? // deep link (ex: https://open.spotify.com/…)
+  metadata       Json? // snapshot normalisé du fournisseur
+  lastSyncedAt   DateTime?
+  lastSyncStatus ExternalSyncStatus @default(NEVER)
+  lastSyncError  String?
+  createdById    String?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  provider         ExternalProviderConfig @relation(fields: [providerId], references: [id])
+  externalSyncJobs ExternalSyncJob[]
+  createdBy        User?                  @relation("ExternalIdentityCreatedBy", fields: [createdById], references: [id])
+
+  @@unique([providerId, entityType, entityId])
+  @@unique([providerId, entityType, externalId])
+  @@index([entityType, entityId])
+  @@index([externalId])
+}
+
+// Connexion du compte Spotify (ou autre provider) d'un UTILISATEUR.
+// Tokens chiffrés AES-256-GCM au repos — JAMAIS exposés au frontend.
+model ExternalAccountConnection {
+  id                  String    @id @default(cuid())
+  userId              String
+  providerId          String
+  externalAccountId   String
+  externalDisplayName String?
+  accessTokenEnc      String // AES-256-GCM
+  refreshTokenEnc     String?
+  scopes              String?
+  expiresAt           DateTime?
+  sandbox             Boolean   @default(false)
+  connectedAt         DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  user     User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider ExternalProviderConfig @relation(fields: [providerId], references: [id])
+
+  @@unique([userId, providerId])
+  @@index([providerId, externalAccountId])
+}
+
+// File de synchronisation — idempotente, reprenable, observable.
+// La sync ne supprime JAMAIS une donnée AENEWS (ajout/mise à jour only).
+model ExternalSyncJob {
+  id         String                @id @default(cuid())
+  providerId String
+  identityId String?
+  entityType ExternalEntityType
+  entityId   String
+  operation  ExternalSyncOperation @default(REFRESH_METADATA)
+  status     ExternalSyncJobStatus @default(PENDING)
+  attempts   Int                   @default(0)
+  lastError  String?
+  startedAt  DateTime?
+  finishedAt DateTime?
+  createdAt  DateTime              @default(now())
+
+  provider ExternalProviderConfig   @relation(fields: [providerId], references: [id])
+  identity ExternalCatalogIdentity? @relation(fields: [identityId], references: [id])
+
+  @@index([status, createdAt])
+  @@index([providerId, entityType, entityId])
 }

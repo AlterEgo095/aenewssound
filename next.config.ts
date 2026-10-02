@@ -2,11 +2,13 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   output: "standalone",
-  /* config options here */
+  // Audit v1.1 F6 : la barrière qualité est RÉACTIVÉE — le build échoue sur
+  // toute erreur TypeScript (le code passe tsc strict propre ; cette garde
+  // empêche une régression de type de partir en production).
   typescript: {
-    ignoreBuildErrors: true,
+    ignoreBuildErrors: false,
   },
-  reactStrictMode: false,
+  reactStrictMode: true,
 };
 
 export default nextConfig;

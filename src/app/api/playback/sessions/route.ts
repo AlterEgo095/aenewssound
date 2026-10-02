@@ -1,6 +1,7 @@
 import { db } from "@/lib/db";
 import { ApiError, handle, ok, parseBody, requireString } from "@/lib/api";
 import { requireAuth } from "@/lib/auth";
+import { rateLimit } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
 
@@ -8,6 +9,7 @@ export const dynamic = "force-dynamic";
 export async function POST(req: Request) {
   return handle(async () => {
     const { user, payload } = await requireAuth(req);
+    rateLimit(`sessions:${user.id}`, 30, 60_000);
     const body = await parseBody<{ trackId?: string; context?: string }>(req);
     const trackId = requireString(body.trackId, "trackId");
 

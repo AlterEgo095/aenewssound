@@ -1,6 +1,10 @@
 import { db } from "@/lib/db";
 import { ApiError } from "@/lib/api";
 import { audit } from "@/lib/audit";
+import type { Prisma } from "@prisma/client";
+
+// Client Prisma polymorphe : db par défaut, transaction ($transaction) possible.
+type DbClient = Prisma.TransactionClient | typeof db;
 
 // Entitlements — SOURCE UNIQUE DE VÉRITÉ (v1.1, règle 1).
 // Aucun module de streaming/download ne doit consulter Payment directement.
@@ -57,8 +61,10 @@ export async function grantEntitlement(opts: {
   source: "PACK_PAYMENT" | "GIFT" | "ADMIN_GRANT" | "TRIAL" | "REFERRAL";
   durationHours: number;
   grantedById?: string | null;
+  tx?: Prisma.TransactionClient;
 }) {
-  const entitlement = await db.entitlement.create({
+  const c: DbClient = opts.tx ?? db;
+  const entitlement = await c.entitlement.create({
     data: {
       userId: opts.userId,
       planId: opts.planId ?? null,
@@ -70,13 +76,17 @@ export async function grantEntitlement(opts: {
       expiresAt: new Date(Date.now() + opts.durationHours * 3600 * 1000),
     },
   });
-  await audit({
-    actorId: opts.grantedById ?? null,
-    action: "entitlement.grant",
-    entityType: "Entitlement",
-    entityId: entitlement.id,
-    after: { userId: opts.userId, source: opts.source, durationHours: opts.durationHours },
-  });
+  // tx fourni ⇒ audit sur le même client (SQLite single-writer, anti P2028).
+  await audit(
+    {
+      actorId: opts.grantedById ?? null,
+      action: "entitlement.grant",
+      entityType: "Entitlement",
+      entityId: entitlement.id,
+      after: { userId: opts.userId, source: opts.source, durationHours: opts.durationHours },
+    },
+    opts.tx
+  );
   return entitlement;
 }
 

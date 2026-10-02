@@ -3,6 +3,7 @@ import { ApiError, handle, ok, parseBody, requireString } from "@/lib/api";
 import { requireAdmin } from "@/lib/auth";
 import { calculatePeriod, createPayouts, transitionPayout } from "@/lib/royalties";
 import { signStreamUrl } from "@/lib/signed-url";
+import { audit } from "@/lib/audit";
 
 export const dynamic = "force-dynamic";
 
@@ -61,6 +62,8 @@ export async function POST(req: Request) {
       payoutId?: string;
       transition?: string;
       reason?: string;
+      periodStart?: string;
+      periodEnd?: string;
     }>(req);
     const action = requireString(body.action, "action", 40);
 
@@ -72,32 +75,63 @@ export async function POST(req: Request) {
       const result = await createPayouts(requireString(body.periodId, "periodId"), user.id);
       return ok(result);
     }
+    if (action === "CREATE_PERIOD") {
+      // Opérationnel : ouverture de la période suivante sans toucher à la DB.
+      const start = new Date(requireString(body.periodStart ?? "", "periodStart"));
+      const end = new Date(requireString(body.periodEnd ?? "", "periodEnd"));
+      if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) {
+        throw new ApiError(400, "Dates de période invalides (ISO attendu)");
+      }
+      if (end.getTime() <= start.getTime()) {
+        throw new ApiError(400, "periodEnd doit être postérieure à periodStart");
+      }
+      const overlap = await db.royaltyPeriod.findFirst({
+        where: { periodStart: { lt: end }, periodEnd: { gt: start } },
+        select: { id: true },
+      });
+      if (overlap) {
+        throw new ApiError(409, "Chevauchement avec une période existante");
+      }
+      const created = await db.royaltyPeriod.create({
+        data: { periodStart: start, periodEnd: end, status: "OPEN" },
+      });
+      await audit({
+        actorId: user.id,
+        action: "royalty.period.create",
+        entityType: "RoyaltyPeriod",
+        entityId: created.id,
+        after: { periodStart: start.toISOString(), periodEnd: end.toISOString() },
+      });
+      return ok({ id: created.id, status: created.status });
+    }
     if (action === "PAYOUT_TRANSITION") {
       const transition = body.transition;
-      if (!transition || !["APPROVE", "SEND", "CONFIRM", "FAIL"].includes(transition)) {
-        throw new ApiError(400, "transition invalide (APPROVE|SEND|CONFIRM|FAIL)");
+      if (!transition || !["APPROVE", "SEND", "CONFIRM", "FAIL", "RETRY"].includes(transition)) {
+        throw new ApiError(400, "transition invalide (APPROVE|SEND|CONFIRM|FAIL|RETRY)");
       }
       const payout = await transitionPayout(
         requireString(body.payoutId, "payoutId"),
-        transition as "APPROVE" | "SEND" | "CONFIRM" | "FAIL",
+        transition as "APPROVE" | "SEND" | "CONFIRM" | "FAIL" | "RETRY",
         user.id,
         body.reason
       );
+      if (!payout) throw new ApiError(500, "Payout introuvable après transition");
       return ok({ payoutId: payout.id, status: payout.status });
     }
     if (action === "STATEMENT_URL") {
-      const period = await db.royaltyPeriod.findUnique({
-        where: { id: requireString(body.periodId, "periodId") },
-        include: { statements: { where: { payeeUserId: body.payoutId ?? undefined } } },
+      // Le statement est retrouvé par le payout : (periodId, payeeUserId du
+      // payout) — plus de filtre incohérent payeeUserId=payoutId.
+      const payout = await db.payout.findUnique({
+        where: { id: requireString(body.payoutId, "payoutId") },
+        select: { periodId: true, payeeUserId: true },
       });
-      void period;
-      const statement = await db.statement.findFirst({
-        where: { periodId: body.periodId },
-        orderBy: { generatedAt: "desc" },
+      if (!payout) throw new ApiError(404, "Payout introuvable");
+      const statement = await db.statement.findUnique({
+        where: { periodId_payeeUserId: { periodId: payout.periodId, payeeUserId: payout.payeeUserId } },
       });
-      if (!statement) throw new ApiError(404, "Aucun relevé pour cette période");
+      if (!statement) throw new ApiError(404, "Aucun relevé pour ce payout");
       return ok({ statementUrl: signStreamUrl(statement.fileKey, 3600), fileKey: statement.fileKey });
     }
-    throw new ApiError(400, "action inconnue (CALCULATE|CREATE_PAYOUTS|PAYOUT_TRANSITION|STATEMENT_URL)");
+    throw new ApiError(400, "action inconnue (CREATE_PERIOD|CALCULATE|CREATE_PAYOUTS|PAYOUT_TRANSITION|STATEMENT_URL)");
   });
 }

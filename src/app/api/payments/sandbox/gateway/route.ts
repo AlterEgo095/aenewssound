@@ -1,6 +1,8 @@
 import { db } from "@/lib/db";
 import { ApiError, clientIp, handle, ok, parseBody, rateLimit } from "@/lib/api";
+import { requireAuth } from "@/lib/auth";
 import { processWebhook, signGatewayPayload } from "@/lib/payments";
+import { SANDBOX_PROVIDER_SECRET } from "@/lib/config";
 
 export const dynamic = "force-dynamic";
 
@@ -22,6 +24,12 @@ type SandboxGatewayBody = {
  */
 export async function POST(req: Request) {
   return handle(async () => {
+    // KILL-SWITCH production : ce rôle (agrégateur simulé) n'existe pas en
+    // production — la route disparaît entièrement au lieu d'être simplement gardée.
+    if (process.env.NODE_ENV === "production") {
+      throw new ApiError(404, "Passerelle sandbox désactivée en production");
+    }
+    const { user } = await requireAuth(req);
     rateLimit(`sandbox-gateway:${clientIp(req)}`, 30, 60_000);
     const body = await parseBody<SandboxGatewayBody>(req);
     if (!body.paymentRef) throw new ApiError(400, "paymentRef requis");
@@ -33,6 +41,11 @@ export async function POST(req: Request) {
     });
     if (!payment || payment.provider.code !== "SANDBOX") {
       throw new ApiError(404, "Paiement sandbox introuvable");
+    }
+    // Seul le PROPRIÉTAIRE du paiement peut simuler la confirmation opérateur
+    // (sinon n'importe qui finalise le providerRef d'autrui, connu via GET /api/payments).
+    if (payment.userId !== user.id) {
+      throw new ApiError(403, "Paiement sandbox d'un autre utilisateur");
     }
     if (["SUCCEEDED", "REFUNDED"].includes(payment.status)) {
       throw new ApiError(409, "Paiement déjà finalisé");
@@ -54,10 +67,10 @@ export async function POST(req: Request) {
         outcome === "FAIL" ? "PIN incorrect / solde insuffisant (simulation opérateur)" : undefined,
       occurredAt: new Date().toISOString(),
     });
-    const signature = signGatewayPayload(
-      payload,
-      process.env.SANDBOX_PROVIDER_SECRET || "aenews-sandbox-gateway-secret-0002"
-    );
+    if (!SANDBOX_PROVIDER_SECRET) {
+      throw new ApiError(503, "Passerelle sandbox non configurée (secret absent)");
+    }
+    const signature = signGatewayPayload(payload, SANDBOX_PROVIDER_SECRET);
 
     const result = await processWebhook({
       providerCode: "SANDBOX",

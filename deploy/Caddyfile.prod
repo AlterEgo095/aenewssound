@@ -1,0 +1,64 @@
+# ============================================================================
+# Caddyfile PRODUCTION — AENEWS SOUND (déploiement VPS)
+#
+# Différences vitales avec le Caddyfile sandbox (audit v1.1 F1) :
+#   - AUCUN handler XTransformPort : le sandbox autorisait le proxy vers
+#     N'IMPORTE QUEL port local via un paramètre d'URL = SSRF d'ingress.
+#   - TLS automatique (Let's Encrypt) sur le domaine réel.
+#   - En-têtes de sécurité (HSTS, anti-clickjacking, anti-sniffing).
+#
+# Déploiement :
+#   1. Remplacer aenews.online par le domaine réel (DNS → VPS, ports 80/443 ouverts)
+#   2. sudo caddy validate --config /etc/caddy/Caddyfile
+#   3. sudo systemctl reload caddy
+#   L'app Next.js écoute sur 127.0.0.1:3000 (jamais exposée directement).
+# ============================================================================
+
+aenews.online, www.aenews.online {
+	encode zstd gzip
+
+	# Sécurité HTTP (audit v1.1) — HSTS, sniffing, clickjacking, referrer.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+
+	# Webhooks agrégateurs mobile money : corps brut requis (HMAC sur le corps
+	# exact), pas de compression côté client, timeouts courts.
+	handle /api/payments/webhook* {
+		reverse_proxy 127.0.0.1:3000 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			flush_interval -1
+		}
+	}
+
+	# Streaming audio : flush immédiat pour le seek/Range, timeouts adaptés.
+	handle /api/stream* {
+		reverse_proxy 127.0.0.1:3000 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			flush_interval -1
+			transport http {
+				response_header_timeout 30s
+			}
+		}
+	}
+
+	# Tout le reste → Next.js standalone.
+	handle {
+		reverse_proxy 127.0.0.1:3000 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+}
+
+# HTTP → HTTPS (Caddy gère la redirection automatiquement, explicite ici).
+http://aenews.online, http://www.aenews.online {
+	redir https://{host}{uri} permanent
+}

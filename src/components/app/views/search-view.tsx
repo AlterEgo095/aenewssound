@@ -230,13 +230,14 @@ export function SearchView() {
                   externalUrl={t.externalUrl}
                   linked={t.linkedAenews}
                   sandbox={external.data!.sandbox}
-                  onOpenLinked={() =>
+                  onOpenLinked={
                     t.linkedAenews!.entityType === "TRACK"
                       ? undefined
-                      : openDetail({
-                          kind: t.linkedAenews!.entityType === "ARTIST" ? "artist" : "album",
-                          id: t.linkedAenews!.entityId,
-                        })
+                      : () =>
+                          openDetail({
+                            kind: t.linkedAenews!.entityType === "ARTIST" ? "artist" : "album",
+                            id: t.linkedAenews!.entityId,
+                          })
                   }
                 />
               ))}

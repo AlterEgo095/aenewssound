@@ -76,6 +76,7 @@ export function LibraryView() {
   const removeFavorite = useMutation({
     mutationFn: (trackId: string) => api(`/api/favorites?trackId=${trackId}`, { method: "DELETE" }),
     onSuccess: () => invalidate(),
+    onError: (e) => toast({ title: e instanceof ApiClientError ? e.message : "Échec de la suppression", variant: "destructive" }),
   });
 
   const deletePlaylist = useMutation({
@@ -85,11 +86,13 @@ export function LibraryView() {
       invalidate();
       toast({ title: "Playlist supprimée" });
     },
+    onError: (e) => toast({ title: e instanceof ApiClientError ? e.message : "Échec de la suppression", variant: "destructive" }),
   });
 
   const removeFromPlaylist = useMutation({
     mutationFn: (trackId: string) => api(`/api/playlists/${openPlaylistId}?trackId=${trackId}`, { method: "DELETE" }),
     onSuccess: () => invalidate(),
+    onError: (e) => toast({ title: e instanceof ApiClientError ? e.message : "Échec du retrait", variant: "destructive" }),
   });
 
   const refreshDownload = useMutation({
@@ -197,7 +200,7 @@ export function LibraryView() {
                       <span className="block text-xs text-zinc-500">{p.trackCount} titres</span>
                     </span>
                   </span>
-                  <span className="text-xs text-zinc-500">{formatDuration(0) && p.updatedAt.slice(0, 10)}</span>
+                  <span className="text-xs text-zinc-500">{p.updatedAt.slice(0, 10)}</span>
                 </button>
               ))}
             </div>

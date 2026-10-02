@@ -3,6 +3,15 @@ import { handle, ok } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
 
+function safeParse(raw: string | null): Record<string, unknown> | null {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null; // donnée corrompue : jamais de 500 brut
+  }
+}
+
 export async function GET() {
   return handle(async () => {
     const plans = await db.subscriptionPlan.findMany({
@@ -19,7 +28,7 @@ export async function GET() {
         priceMinor: Number(p.priceMinor),
         currency: p.currency,
         maxDevices: p.maxDevices,
-        features: p.features ? (JSON.parse(p.features) as Record<string, unknown>) : null,
+        features: safeParse(p.features),
       })),
     });
   });

@@ -1,20 +1,56 @@
 import crypto from "crypto";
 import { db } from "@/lib/db";
 import { ApiError } from "@/lib/api";
-import { ACCESS_TOKEN_TTL_SECONDS, REFRESH_TOKEN_TTL_SECONDS } from "@/lib/config";
+import {
+  ACCESS_TOKEN_TTL_SECONDS,
+  REFRESH_TOKEN_TTL_SECONDS,
+  AUTH_SECRET,
+} from "@/lib/config";
 
 // ---------------------------------------------------------------------------
-// Mots de passe : scrypt (sel aléatoire par utilisateur, comparaison timing-safe)
+// Mots de passe : scrypt versionné (sel aléatoire, paramètres encodés dans le
+// hash, comparaison timing-safe). Format : scrypt$N$r$p$salt$hash.
+// Les anciens hash "salt:hash" (défauts Node N=16384,r=8,p=1) restent vérifiés.
 // ---------------------------------------------------------------------------
+
+const SCRYPT_N = 32768; // 2^15 — compromis sécurité/coût serveur
+const SCRYPT_MAXMEM = 64 * 1024 * 1024; // 128*N*r ≈ 33,6 Mo > défaut Node (32 Mo)
+const SCRYPT_r = 8;
+const SCRYPT_p = 1;
 
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16);
-  const hash = crypto.scryptSync(password, salt, 64);
-  return `${salt.toString("hex")}:${hash.toString("hex")}`;
+  const hash = crypto.scryptSync(password, salt, 64, {
+    N: SCRYPT_N,
+    r: SCRYPT_r,
+    p: SCRYPT_p,
+    // 128*N*r dépasse le maxmem par défaut de Node (32 Mo) : il faut le relever.
+    maxmem: SCRYPT_MAXMEM,
+  });
+  return `scrypt$${SCRYPT_N}$${SCRYPT_r}$${SCRYPT_p}$${salt.toString("hex")}:${hash.toString("hex")}`;
 }
 
 export function verifyPassword(password: string, stored: string | null): boolean {
   if (!stored) return false;
+  if (stored.startsWith("scrypt$")) {
+    const [, nStr, rStr, pStr, rest] = stored.split("$");
+    const [saltHex, hashHex] = (rest ?? "").split(":");
+    const N = Number(nStr);
+    const r = Number(rStr);
+    const p = Number(pStr);
+    if (!saltHex || !hashHex || !Number.isInteger(N) || !Number.isInteger(r) || !Number.isInteger(p)) {
+      return false;
+    }
+    const hash = crypto.scryptSync(password, Buffer.from(saltHex, "hex"), 64, {
+      N,
+      r,
+      p,
+      maxmem: SCRYPT_MAXMEM,
+    });
+    const expected = Buffer.from(hashHex, "hex");
+    return hash.length === expected.length && crypto.timingSafeEqual(hash, expected);
+  }
+  // Format historique (défauts Node) — vérifié tel quel.
   const [saltHex, hashHex] = stored.split(":");
   if (!saltHex || !hashHex) return false;
   const hash = crypto.scryptSync(password, Buffer.from(saltHex, "hex"), 64);
@@ -37,10 +73,8 @@ export function randomToken(bytes = 48): string {
 }
 
 function hmac(data: string): string {
-  return crypto
-    .createHmac("sha256", process.env.AUTH_SECRET || "aenews-dev-secret-do-not-use-in-production-0001")
-    .update(data)
-    .digest("base64url");
+  // Source unique : AUTH_SECRET dérive de config.ts (fail-fast en production).
+  return crypto.createHmac("sha256", AUTH_SECRET).update(data).digest("base64url");
 }
 
 export type AccessPayload = {
@@ -70,6 +104,13 @@ export function verifyAccessToken(token: string): AccessPayload | null {
   const parts = token.split(".");
   if (parts.length !== 3) return null;
   const [header, payload, signature] = parts;
+  // Garde-fou : l'algorithme est figé (pas d'alg=none / confusion HS/RS).
+  try {
+    const h = JSON.parse(Buffer.from(header, "base64url").toString()) as { alg?: string };
+    if (h.alg !== "HS256") return null;
+  } catch {
+    return null;
+  }
   const expected = hmac(`${header}.${payload}`);
   const sigBuf = Buffer.from(signature);
   const expBuf = Buffer.from(expected);

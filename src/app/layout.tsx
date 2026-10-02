@@ -19,7 +19,7 @@ export const metadata: Metadata = {
     "Plateforme audio distribuée : rumba, ndombolo, gospel et plus — streaming adaptatif, offline premium, paiements mobile money.",
   keywords: ["AENEWS SOUND", "musique congolaise", "rumba", "streaming", "Kinshasa"],
   icons: {
-    icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
+    icon: "/logo.svg",
   },
   openGraph: {
     title: "AENEWS SOUND",
@@ -35,7 +35,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="fr" suppressHydrationWarning>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground`}
       >

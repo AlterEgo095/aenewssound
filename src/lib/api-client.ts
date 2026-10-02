@@ -38,7 +38,12 @@ async function tryRefresh(): Promise<boolean> {
           body: JSON.stringify({ refreshToken }),
         });
         if (!res.ok) {
-          clear();
+          // 401/403 = refresh refusé (session réellement morte) → déconnexion.
+          // 5xx passager = panne serveur : on ne purge PAS la session, l'app
+          // réessaiera plus tard (sinon un 500 jetterait la session au vent).
+          if (res.status === 401 || res.status === 403) {
+            clear();
+          }
           return false;
         }
         const data = (await res.json()) as {

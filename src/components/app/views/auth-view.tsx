@@ -12,11 +12,17 @@ import { useAuthStore, type MeResponse } from "@/lib/stores";
 
 type AuthResponse = MeResponse & { accessToken: string; refreshToken: string };
 
-const DEMO_ACCOUNTS = [
-  { label: "Écouteur démo", phone: "+243000000003", password: "ecoute-aenews-2024" },
-  { label: "Admin", phone: "+243000000001", password: "admin-aenews-2024" },
-  { label: "Artiste", phone: "+243000000002", password: "artiste-aenews-2024" },
-];
+// Comptes de démonstration : JAMAIS compilés dans le bundle de production
+// (le mot de passe admin livré à chaque visiteur serait une compromission
+// immédiate). En production : aucun raccourci de login.
+const DEMO_ACCOUNTS =
+  process.env.NODE_ENV === "production"
+    ? []
+    : [
+        { label: "Écouteur démo", phone: "+243000000003", password: "ecoute-aenews-2024" },
+        { label: "Admin", phone: "+243000000001", password: "admin-aenews-2024" },
+        { label: "Artiste", phone: "+243000000002", password: "artiste-aenews-2024" },
+      ];
 
 export function AuthView() {
   const setSession = useAuthStore((s) => s.setSession);

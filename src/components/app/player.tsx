@@ -23,6 +23,7 @@ import {
 } from "@/lib/stores";
 import { ArtworkImg, formatDuration } from "@/components/app/ui-bits";
 import { cn } from "@/lib/utils";
+import { useToast } from "@/hooks/use-toast";
 
 // ---------------------------------------------------------------------------
 // EVENT PIPELINE (v1.1 §16) : accumulation locale → batch → /api/events/batch
@@ -68,6 +69,23 @@ function stopFlushTimer() {
   }
 }
 
+// Synchronise la barre de progression de l'écran de verrouillage (MediaSession).
+function syncPositionState(audio: HTMLAudioElement) {
+  if ("mediaSession" in navigator && typeof navigator.mediaSession.setPositionState === "function") {
+    try {
+      if (Number.isFinite(audio.duration) && audio.duration > 0) {
+        navigator.mediaSession.setPositionState({
+          duration: audio.duration,
+          playbackRate: audio.playbackRate,
+          position: Math.min(audio.currentTime, audio.duration),
+        });
+      }
+    } catch {
+      // navigateur sans support complet : silencieux (non bloquant)
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // PlayerProvider — le lecteur est un service central, pas un composant UI.
 // ---------------------------------------------------------------------------
@@ -77,6 +95,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
   const current = queue[index] as TrackDTO | undefined;
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const stallSince = useRef<number | null>(null);
+  const { toast } = useToast();
 
   // Chargement d'une nouvelle piste : stream signé + session + PLAY_START.
   useEffect(() => {
@@ -94,6 +113,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     (async () => {
       setState({ loading: true, position: 0, duration: 0 });
       try {
+        // Le résidu d'événements de la piste précédente part AVANT le PLAY_START
+        // (jamais de perte de PLAY_PROGRESS entre deux pistes).
+        await flushEvents();
+        eventQueue.length = 0;
         const stream = await api<{
           signedUrl: string;
           variant: { kind: string; codec: string; deliveryFormat: string };
@@ -106,7 +129,6 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
 
         setState({ sessionId: session.sessionId, loading: false });
         lastProgressFlush = 0;
-        eventQueue.length = 0;
         pushEvent({
           kind: "PLAY_START",
           trackId: current.id,
@@ -138,14 +160,34 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
       } catch (e) {
         if (cancelled) return;
         setState({ loading: false, playing: false });
-        if (e instanceof ApiClientError) {
-          console.error("[player]", e.message);
-        }
+        // Fini le silent fail : l'utilisateur voit POURQUOI la lecture ne part pas
+        // (droits 402/451, média non prêt 409, réseau…).
+        const message =
+          e instanceof ApiClientError
+            ? e.message
+            : "Erreur réseau — vérifiez votre connexion et réessayez";
+        toast({ title: "Lecture impossible", description: message, variant: "destructive" });
+        console.error("[player]", message);
       }
     })();
 
     return () => {
       cancelled = true;
+      // Skip / fin / démontage : les événements restants partent PUIS la session
+      // de la piste précédente est fermée (les événements d'une session close
+      // seraient refusés par le serveur — ordre strict flush → PUT).
+      const state = usePlayerStore.getState();
+      const sessionId = state.sessionId;
+      void (async () => {
+        await flushEvents();
+        if (sessionId) {
+          await api("/api/playback/sessions", {
+            method: "PUT",
+            body: { sessionId },
+          }).catch(() => undefined);
+        }
+      })();
+      stopFlushTimer();
     };
      
   }, [current?.id]);
@@ -163,6 +205,7 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
     const onTimeUpdate = () => {
       const pos = audio.currentTime;
       setState({ position: pos });
+      syncPositionState(audio);
       // Une écoute > 30 s doit être visible côté serveur : flush progress régulier.
       if (pos - lastProgressFlush >= 30) {
         lastProgressFlush = pos;
@@ -176,7 +219,10 @@ export function PlayerProvider({ children }: { children: React.ReactNode }) {
         });
       }
     };
-    const onLoadedMetadata = () => setState({ duration: audio.duration });
+    const onLoadedMetadata = () => {
+      setState({ duration: audio.duration });
+      syncPositionState(audio);
+    };
     const onWaiting = () => {
       stallSince.current = performance.now();
       const state = usePlayerStore.getState();

@@ -38,13 +38,15 @@ export function AppShell() {
     ensureDeviceId();
   }, []);
 
-  // Recharge /me au montage si une session existe (statut premium à jour).
+  // Recharge /me au montage ET après chaque (re)connexion (statut premium à
+  // jour) — accessToken dans les deps : sans lui, un abonné fraîchement loggué
+  // restait affiché « Gratuit » jusqu'au prochain paiement ou reload.
   useEffect(() => {
     if (!mounted || !accessToken) return;
     api<MeResponse>("/api/auth/me")
       .then(setMe)
       .catch(() => undefined);
-  }, [mounted]);
+  }, [mounted, accessToken, setMe]);
 
   const queryClient = useMemo(
     () =>
@@ -107,11 +109,15 @@ export function AppShell() {
               )}
             </main>
 
-            <footer className="border-t border-zinc-900 px-4 py-2 text-center text-[11px] text-zinc-600">
+            <footer className="mt-auto border-t border-zinc-900 px-4 py-2 text-center text-[11px] text-zinc-500">
               AENEWS SOUND — plateforme audio distribuée · streaming adaptatif · offline premium · mobile money
             </footer>
 
-            <MiniPlayer />
+            {/* MiniPlayer persistant : ancré au-dessus de la nav sticky, visible
+                pendant le scroll (contrôle principal de l'app musique). */}
+            <div className="sticky bottom-[calc(3.25rem+env(safe-area-inset-bottom))] z-20">
+              <MiniPlayer />
+            </div>
             <FullPlayer />
 
             <nav

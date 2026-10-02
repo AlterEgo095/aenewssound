@@ -2,9 +2,21 @@ import crypto from "crypto";
 import { db } from "@/lib/db";
 import { ApiError, ApiError as ApiErr } from "@/lib/api";
 import { sha256 } from "@/lib/auth";
-import { grantEntitlement, revokeEntitlement } from "@/lib/entitlements";
+import { grantEntitlement } from "@/lib/entitlements";
 import { audit } from "@/lib/audit";
-import { PAYMENT_USSD_TIMEOUT_MINUTES } from "@/lib/config";
+import { PAYMENT_USSD_TIMEOUT_MINUTES, SANDBOX_PROVIDER_SECRET } from "@/lib/config";
+
+// Transitions autorisées vers SUCCEEDED : tout état "en attente" + EXPIRED/FAILED
+// (l'opérateur peut confirmer avec retard — l'argent a été réellement pris).
+// JAMAIS depuis REFUNDED (l'argent a été rendu) ni CANCELLED (annulé client).
+const SUCCEEDED_ALLOWED_FROM = [
+  "INITIATED",
+  "AWAITING_USSD",
+  "PENDING",
+  "EXPIRED",
+  "FAILED",
+] as const;
+const OPEN_STATUSES = ["INITIATED", "AWAITING_USSD", "PENDING"] as const;
 
 // ---------------------------------------------------------------------------
 // Idempotence (v1.1 §27) : toute mutation de paiement exige Idempotency-Key.
@@ -25,7 +37,20 @@ export async function withIdempotency<T>(opts: {
   const requestHash = sha256(JSON.stringify(opts.requestBody ?? null));
   const expiresAt = new Date(Date.now() + 24 * 3600 * 1000);
 
+  // Rejeu scoppé : une clé appartient à UN utilisateur et UNE route, et n'est
+  // rejouable que dans sa fenêtre de validité — jamais la réponse d'autrui.
+  const scopeMatches = (
+    r: { userId: string | null; endpoint: string; expiresAt: Date } | null
+  ): boolean =>
+    r !== null &&
+    r.userId === (opts.userId ?? null) &&
+    r.endpoint === opts.endpoint &&
+    r.expiresAt.getTime() > Date.now();
+
   let record = await db.idempotencyKey.findUnique({ where: { key } });
+  if (record && !scopeMatches(record)) {
+    throw new ApiError(409, "Clé d'idempotence déjà utilisée — générez une nouvelle clé");
+  }
   if (!record) {
     record = await db.idempotencyKey
       .create({
@@ -38,8 +63,11 @@ export async function withIdempotency<T>(opts: {
         },
       })
       .catch(async () => {
+        // Course : une requête concurrente a créé la clé avant nous.
         const race = await db.idempotencyKey.findUnique({ where: { key } });
-        if (!race) throw new ApiError(409, "Conflit d'idempotence");
+        if (!race || !scopeMatches(race)) {
+          throw new ApiError(409, "Clé d'idempotence déjà utilisée — générez une nouvelle clé");
+        }
         return race;
       });
   }
@@ -55,16 +83,36 @@ export async function withIdempotency<T>(opts: {
     };
   }
 
-  const result = await opts.run();
-  await db.idempotencyKey.update({
-    where: { id: record.id },
-    data: {
-      status: "COMPLETED",
-      responseStatus: result.status,
-      responseBody: JSON.stringify(result.body),
-    },
+  // Claim atomique : une seule exécution concurrente par clé (sinon double
+  // push USSD = double débit possible). Le perdant reçoit 409 et rejeuera.
+  const claim = await db.idempotencyKey.updateMany({
+    where: { id: record.id, status: "OPEN" },
+    data: { status: "PROCESSING" },
   });
-  return { ...result, replayed: false };
+  if (claim.count !== 1) {
+    throw new ApiError(409, "Requête identique déjà en cours — réessayez plus tard");
+  }
+  try {
+    const result = await opts.run();
+    await db.idempotencyKey.update({
+      where: { id: record.id },
+      data: {
+        status: "COMPLETED",
+        responseStatus: result.status,
+        responseBody: JSON.stringify(result.body),
+      },
+    });
+    return { ...result, replayed: false };
+  } catch (e) {
+    // Libère la clé : le client peut rejouer la MÊME clé après un échec serveur.
+    await db.idempotencyKey
+      .updateMany({
+        where: { id: record.id, status: "PROCESSING" },
+        data: { status: "OPEN" },
+      })
+      .catch(() => undefined);
+    throw e;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -150,10 +198,80 @@ export async function processWebhook(opts: {
   const provider = await db.paymentProvider.findUnique({ where: { code: opts.providerCode } });
   if (!provider) throw new ApiError(404, "Provider inconnu");
 
-  const signatureValid = verifyGatewaySignature(opts.rawBody, opts.signature, secretFor(provider.code));
-  const event = JSON.parse(opts.rawBody) as GatewayEvent;
+  // FAIL-CLOSED : secretFor() lève 503 si le secret du provider n'est pas
+  // configuré — un webhook non configuré n'est JAMAIS vérifié contre un secret
+  // de secours public (sinon n'importe qui forgerait des paiements réussis).
+  const secret = secretFor(provider.code);
 
-  // Persistance systématique du callback (même signature invalide : traçabilité).
+  let event: GatewayEvent;
+  try {
+    event = JSON.parse(opts.rawBody) as GatewayEvent;
+  } catch {
+    // Corps illisible : persistance placeholder (traçabilité) puis rejet.
+    await db.webhookEvent.create({
+      data: {
+        providerId: provider.id,
+        providerEventId: `unparseable-${sha256(opts.rawBody).slice(0, 24)}`,
+        eventType: "unknown",
+        signatureValid: false,
+        payload: opts.rawBody.slice(0, 4000),
+        status: "IGNORED",
+        error: "Corps non JSON",
+      },
+    });
+    throw new ApiError(400, "Corps webhook illisible");
+  }
+
+  const signatureValid = verifyGatewaySignature(opts.rawBody, opts.signature, secret);
+
+  // La vérification de signature PRÉCÈDE toujours le dédoublonnage : un
+  // attaquant sans le secret ne peut plus pré-enregistrer un eventId pour
+  // faire ignorer le vrai callback de l'agrégateur (attaque par dédoublon).
+  if (!signatureValid) {
+    const existingInvalid = await db.webhookEvent.findUnique({
+      where: { providerId_providerEventId: { providerId: provider.id, providerEventId: event.eventId ?? "none" } },
+    });
+    const webhookEvent = existingInvalid
+      ? await db.webhookEvent.update({
+          where: { id: existingInvalid.id },
+          data: { status: "IGNORED", signatureValid: false },
+        })
+      : await db.webhookEvent.create({
+          data: {
+            providerId: provider.id,
+            providerEventId: event.eventId ?? `invalid-${sha256(opts.rawBody).slice(0, 24)}`,
+            eventType: event.event ?? "unknown",
+            signatureValid: false,
+            payload: opts.rawBody.slice(0, 4000),
+            status: "IGNORED",
+          },
+        });
+    await audit({
+      action: "payment.webhook.invalid_signature",
+      entityType: "WebhookEvent",
+      entityId: webhookEvent.id,
+      after: { provider: provider.code, eventId: event.eventId },
+      ip: opts.ip ?? null,
+    });
+    throw new ApiError(401, "Signature webhook invalide");
+  }
+
+  // Signature valide : validation des champs obligatoires puis idempotence.
+  if (!event.eventId || !event.event || !event.paymentRef || !event.occurredAt) {
+    await db.webhookEvent.create({
+      data: {
+        providerId: provider.id,
+        providerEventId: event.eventId || `malformed-${sha256(opts.rawBody).slice(0, 24)}`,
+        eventType: event.event ?? "unknown",
+        signatureValid: true,
+        payload: opts.rawBody.slice(0, 4000),
+        status: "FAILED",
+        error: "Champs obligatoires manquants (eventId/event/paymentRef/occurredAt)",
+      },
+    });
+    throw new ApiError(400, "Webhook malformé — champs obligatoires manquants");
+  }
+
   const existing = await db.webhookEvent.findUnique({
     where: { providerId_providerEventId: { providerId: provider.id, providerEventId: event.eventId } },
   });
@@ -170,22 +288,11 @@ export async function processWebhook(opts: {
       providerId: provider.id,
       providerEventId: event.eventId,
       eventType: event.event,
-      signatureValid,
+      signatureValid: true,
       payload: opts.rawBody,
-      status: signatureValid ? "PROCESSING" : "IGNORED",
+      status: "PROCESSING",
     },
   });
-
-  if (!signatureValid) {
-    await audit({
-      action: "payment.webhook.invalid_signature",
-      entityType: "WebhookEvent",
-      entityId: webhookEvent.id,
-      after: { provider: provider.code, eventId: event.eventId },
-      ip: opts.ip ?? null,
-    });
-    throw new ApiError(401, "Signature webhook invalide");
-  }
 
   const payment = await db.payment.findUnique({
     where: { providerId_providerRef: { providerId: provider.id, providerRef: event.paymentRef } },
@@ -198,45 +305,78 @@ export async function processWebhook(opts: {
     throw new ApiError(404, "Paiement introuvable");
   }
 
+  // Contrôle d'intégrité : un callback dont le montant diverge du paiement
+  // n'est jamais appliqué (montant toujours piloté par le serveur).
+  if (event.amountMinor != null && event.amountMinor !== payment.amountMinor.toString()) {
+    await db.webhookEvent.update({
+      where: { id: webhookEvent.id },
+      data: { paymentId: payment.id, status: "FAILED", error: "Montant divergent" },
+    });
+    await audit({
+      action: "payment.webhook.amount_mismatch",
+      entityType: "Payment",
+      entityId: payment.id,
+      after: { event: event.event, expected: payment.amountMinor.toString(), received: event.amountMinor },
+      ip: opts.ip ?? null,
+    });
+    throw new ApiError(409, "Montant du callback divergent — événement refusé");
+  }
+
   await db.webhookEvent.update({ where: { id: webhookEvent.id }, data: { paymentId: payment.id } });
 
   let finalStatus = payment.status;
 
   if (event.event === "payment.succeeded") {
-    // Transition idempotente : un paiement déjà SUCCEEDED ne re-crée pas de droit.
-    if (payment.status !== "SUCCEEDED") {
-      const updated = await db.payment.update({
-        where: { id: payment.id },
+    // Transition conditionnelle ATOMIQUE (updateMany + count) puis création de
+    // l'entitlement dans la MÊME transaction : deux webhooks concurrents ne
+    // peuvent pas créer deux droits (garde count===1), et un échec ne laisse
+    // jamais un paiement SUCCEEDED sans droit.
+    const granted = await db.$transaction(async (tx) => {
+      const upd = await tx.payment.updateMany({
+        where: { id: payment.id, status: { in: [...SUCCEEDED_ALLOWED_FROM] } },
         data: { status: "SUCCEEDED", statusReason: null, completedAt: new Date() },
       });
-      finalStatus = updated.status;
+      if (upd.count !== 1) return false;
+      const plan = await tx.subscriptionPlan.findUnique({ where: { id: payment.planId } });
       await grantEntitlement({
         userId: payment.userId,
         planId: payment.planId,
         paymentId: payment.id,
         source: "PACK_PAYMENT",
-        durationHours: (await db.subscriptionPlan.findUnique({ where: { id: payment.planId } }))
-          ?.durationHours ?? 24,
+        durationHours: plan?.durationHours ?? 24,
+        tx,
       });
-    }
+      return true;
+    });
+    finalStatus = granted ? "SUCCEEDED" : payment.status;
   } else if (event.event === "payment.failed") {
-    if (["INITIATED", "AWAITING_USSD", "PENDING"].includes(payment.status)) {
-      const updated = await db.payment.update({
-        where: { id: payment.id },
-        data: { status: "FAILED", statusReason: event.reason ?? "Échec opérateur", completedAt: new Date() },
-      });
-      finalStatus = updated.status;
-    }
+    const updated = await db.payment.updateMany({
+      where: { id: payment.id, status: { in: [...OPEN_STATUSES] } },
+      data: { status: "FAILED", statusReason: event.reason ?? "Échec opérateur", completedAt: new Date() },
+    });
+    if (updated.count === 1) finalStatus = "FAILED";
   } else if (event.event === "payment.expired") {
-    if (["INITIATED", "AWAITING_USSD", "PENDING"].includes(payment.status)) {
-      const updated = await db.payment.update({
-        where: { id: payment.id },
-        data: { status: "EXPIRED", statusReason: event.reason ?? "Expiré opérateur", completedAt: new Date() },
-      });
-      finalStatus = updated.status;
-    }
+    const updated = await db.payment.updateMany({
+      where: { id: payment.id, status: { in: [...OPEN_STATUSES] } },
+      data: { status: "EXPIRED", statusReason: event.reason ?? "Expiré opérateur", completedAt: new Date() },
+    });
+    if (updated.count === 1) finalStatus = "EXPIRED";
   } else if (event.event === "payment.refunded") {
     finalStatus = (await refundPayment(payment.id, null, event.reason ?? "Remboursement opérateur")).status;
+  } else {
+    // Type d'événement inconnu : IGNORÉ (jamais PROCESSED) + traçable.
+    await db.webhookEvent.update({
+      where: { id: webhookEvent.id },
+      data: { status: "IGNORED", error: `Type d'événement inconnu : ${event.event}` },
+    });
+    await audit({
+      action: "payment.webhook.ignored",
+      entityType: "WebhookEvent",
+      entityId: webhookEvent.id,
+      after: { provider: provider.code, event: event.event },
+      ip: opts.ip ?? null,
+    });
+    return { accepted: true, duplicate: false, status: payment.status };
   }
 
   await db.webhookEvent.update({
@@ -257,30 +397,55 @@ export async function processWebhook(opts: {
 
 function secretFor(providerCode: string): string {
   // En production : SANDBOX_PROVIDER_SECRET / FLEXPAY_SECRET / CINETPAY_SECRET…
+  // FAIL-CLOSED : pas de secret configuré = pas de vérification possible =
+  // webhook rejeté (503). JAMAIS de fallback vers un secret public.
   if (providerCode === "SANDBOX") {
-    return process.env.SANDBOX_PROVIDER_SECRET || "aenews-sandbox-gateway-secret-0002";
+    // Source unique : config.ts (fallback dev explicite, undefined en prod).
+    if (!SANDBOX_PROVIDER_SECRET) {
+      throw new ApiError(503, "Passerelle sandbox non configurée — webhook rejeté");
+    }
+    return SANDBOX_PROVIDER_SECRET;
   }
-  return process.env[`${providerCode}_SECRET`] || SANDBOX_FALLBACK;
+  const s = process.env[`${providerCode}_SECRET`];
+  if (!s) {
+    throw new ApiError(
+      503,
+      `Provider ${providerCode} non configuré — webhook rejeté (fail-closed)`
+    );
+  }
+  return s;
 }
-
-const SANDBOX_FALLBACK = "aenews-sandbox-gateway-secret-0002";
 
 export async function refundPayment(paymentId: string, actorId: string | null, reason: string) {
   const payment = await db.payment.findUnique({ where: { id: paymentId } });
   if (!payment) throw new ApiErr(404, "Paiement introuvable");
   if (payment.status === "REFUNDED") return payment;
 
-  const updated = await db.payment.update({
-    where: { id: paymentId },
-    data: { status: "REFUNDED", statusReason: reason, completedAt: new Date() },
+  // TRANSACTION : paiement, entitlements et licences de téléchargement changent
+  // d'état ensemble — un crash intermédiaire ne peut plus laisser un paiement
+  // remboursé avec un accès premium actif (perte sèche).
+  const { updated, revokedCount } = await db.$transaction(async (tx) => {
+    const u = await tx.payment.update({
+      where: { id: paymentId },
+      data: { status: "REFUNDED", statusReason: reason, completedAt: new Date() },
+    });
+    const active = await tx.entitlement.findMany({
+      where: { paymentId, status: "ACTIVE" },
+      select: { id: true },
+    });
+    await tx.entitlement.updateMany({
+      where: { paymentId, status: "ACTIVE" },
+      data: { status: "REVOKED", revokedAt: new Date(), revokeReason: reason },
+    });
+    await tx.download.updateMany({
+      where: {
+        entitlementId: { in: active.map((e) => e.id) },
+        status: { in: ["READY", "PREPARING", "REQUESTED"] },
+      },
+      data: { status: "REVOKED", revokedAt: new Date() },
+    });
+    return { updated: u, revokedCount: active.length };
   });
-
-  const entitlements = await db.entitlement.findMany({
-    where: { paymentId, status: "ACTIVE" },
-  });
-  for (const entitlement of entitlements) {
-    await revokeEntitlement(entitlement.id, reason, actorId ?? "system");
-  }
 
   await audit({
     actorId,
@@ -288,7 +453,7 @@ export async function refundPayment(paymentId: string, actorId: string | null, r
     entityType: "Payment",
     entityId: paymentId,
     before: { status: payment.status },
-    after: { status: "REFUNDED", revokedEntitlements: entitlements.length },
+    after: { status: "REFUNDED", revokedEntitlements: revokedCount },
   });
   return updated;
 }

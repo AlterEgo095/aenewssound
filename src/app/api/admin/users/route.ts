@@ -45,6 +45,9 @@ export async function POST(req: Request) {
       throw new ApiError(403, "Seul un SUPER_ADMIN peut agir sur un SUPER_ADMIN");
     }
 
+    if (body.action === "SUSPEND" && userId === actor.id) {
+      throw new ApiError(409, "Un administrateur ne peut pas suspendre son propre compte");
+    }
     const nextStatus = body.action === "SUSPEND" ? "SUSPENDED" : "ACTIVE";
     const updated = await db.user.update({ where: { id: userId }, data: { status: nextStatus } });
     if (nextStatus === "SUSPENDED") {

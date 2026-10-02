@@ -387,7 +387,7 @@ async function main() {
     const slug = slugify(def.title);
     const track = await db.track.upsert({
       where: { slug },
-      update: { status: def.status },
+      update: {}, // statut inchangé : le seed ne réécrit jamais la modération
       create: {
         mainArtistId: artistId,
         albumId,

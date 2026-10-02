@@ -58,3 +58,7 @@ server.log
 /download
 /tool-results
 /agent-ctx
+.zscripts/
+/examples
+/tests
+/mini-services

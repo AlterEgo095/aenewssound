@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, BadgeCheck, ExternalLink, Play } from "lucide-react";
-import { api } from "@/lib/api-client";
+import { api, ApiClientError } from "@/lib/api-client";
 import { usePlayerStore, useViewStore, type AlbumDTO, type ArtistDTO, type TrackDTO } from "@/lib/stores";
 import { AlbumCardGrid, ArtworkImg, SectionHeader, TrackRow, formatDuration } from "@/components/app/ui-bits";
 import { Button } from "@/components/ui/button";
@@ -66,6 +66,8 @@ export function DetailView() {
       toast({ title: "Vous suivez cet artiste" });
       void queryClient.invalidateQueries({ queryKey: ["artist", detail.id] });
     },
+    onError: (e) =>
+      toast({ title: e instanceof ApiClientError ? e.message : "Échec", variant: "destructive" }),
   });
 
   if (detail.kind === "artist") {

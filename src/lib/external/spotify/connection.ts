@@ -10,7 +10,7 @@
 
 import { db } from "@/lib/db";
 import { AUTH_SECRET } from "@/lib/config";
-import { createHmac } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { encryptToken } from "@/lib/external/crypto";
 import { spotifyCredentialsFromEnv } from "./api";
 
@@ -18,13 +18,19 @@ export const SPOTIFY_SCOPES = "user-read-email user-read-private playlist-read-p
 
 const STATE_TTL_MS = 10 * 60 * 1000;
 
+// Nom du cookie de liaison state↔session (anti account-linkage CSRF) : le
+// nonce du state DOIT correspondre au cookie HttpOnly posé par /start. Sans
+// cela, un state divulgué (logs, Referer, historique) pourrait compléter un
+// OAuth au profit d'un tiers pendant sa fenêtre de validité.
+export const SPOTIFY_STATE_COOKIE = "aenews_spotify_oauth_state";
+
 export function spotifyStateSign(userId: string, nonce: string): string {
   const payload = `${userId}.${nonce}.${Date.now()}`;
   const sig = createHmac("sha256", AUTH_SECRET).update(payload).digest("base64url");
   return `${Buffer.from(payload).toString("base64url")}.${sig}`;
 }
 
-export function spotifyStateVerify(state: string): { userId: string } | null {
+export function spotifyStateVerify(state: string): { userId: string; nonce: string } | null {
   const [payloadB64, sig] = state.split(".");
   if (!payloadB64 || !sig) return null;
   let payload: string;
@@ -33,12 +39,16 @@ export function spotifyStateVerify(state: string): { userId: string } | null {
   } catch {
     return null;
   }
-  const expected = createHmac("sha256", AUTH_SECRET).update(payload).digest("base64url");
-  if (sig !== expected) return null; // state invalide / falsifié
-  const [userId, , issuedAt] = payload.split(".");
-  if (!userId || !issuedAt) return null;
+  const expected = Buffer.from(
+    createHmac("sha256", AUTH_SECRET).update(payload).digest("base64url")
+  );
+  const provided = Buffer.from(sig);
+  // Comparaison constant-time (le `!==` direct fuit le préfixe commun par timing).
+  if (expected.length !== provided.length || !timingSafeEqual(expected, provided)) return null;
+  const [userId, nonce, issuedAt] = payload.split(".");
+  if (!userId || !nonce || !issuedAt) return null;
   if (Date.now() - Number(issuedAt) > STATE_TTL_MS) return null; // expiré
-  return { userId };
+  return { userId, nonce };
 }
 
 /** URL d'autorisation réelle (Authorization Code) vers accounts.spotify.com. */

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BadgeCheck, Clock, Loader2, Smartphone, Wallet } from "lucide-react";
 import { api, ApiClientError } from "@/lib/api-client";
@@ -75,12 +75,24 @@ export function SubscribeView() {
     void queryClient.invalidateQueries({ queryKey: ["payments"] });
   };
 
+  // Clé d'idempotence STABLE par intention (v1.1 §27) : régénérée au changement
+  // de plan, RÉUTILISÉE en cas de re-clic après un timeout réseau (sinon double
+  // initiation), et remise à zéro après un paiement terminal (un nouvel achat
+  // du même pack doit créer un NOUVEAU paiement, pas rejouer l'ancien).
+  const intentKeyRef = useRef<{ plan: string; key: string } | null>(null);
+  const idempotencyKeyFor = (planCode: string) => {
+    if (intentKeyRef.current?.plan !== planCode) {
+      intentKeyRef.current = { plan: planCode, key: `init-${planCode}-${crypto.randomUUID()}` };
+    }
+    return intentKeyRef.current.key;
+  };
+
   const initiate = useMutation({
     mutationFn: async () => {
       const res = await api<InitiateResponse>("/api/payments/initiate", {
         method: "POST",
         body: { planCode: selectedPlan!.code, phoneNumber: phone },
-        idempotencyKey: `init-${selectedPlan!.code}-${crypto.randomUUID()}`,
+        idempotencyKey: idempotencyKeyFor(selectedPlan!.code),
       });
       return res;
     },
@@ -108,6 +120,7 @@ export function SubscribeView() {
       }
       setPinStep(false);
       setPayment(null);
+      intentKeyRef.current = null;
       setSelectedPlan(null);
     },
     onError: (e) =>

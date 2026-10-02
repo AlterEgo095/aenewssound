@@ -4,6 +4,17 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Ban, Check, Download, Pause, Play, RefreshCw, ShieldAlert } from "lucide-react";
 import { api, ApiClientError } from "@/lib/api-client";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -13,6 +24,47 @@ import { useToast } from "@/hooks/use-toast";
 import { formatCDF } from "@/components/app/ui-bits";
 import { ExternalView } from "@/components/app/views/external-view";
 import { cn } from "@/lib/utils";
+
+// Bouton destructeur à double confirmation (audit v1.1 F4) : remboursement,
+// blocage, suspension, confirmation de payout — aucun clic involontaire.
+function ConfirmButton({
+  label,
+  icon,
+  className,
+  title,
+  description,
+  confirmLabel,
+  onConfirm,
+}: {
+  label: string;
+  icon?: React.ReactNode;
+  className?: string;
+  title: string;
+  description: string;
+  confirmLabel: string;
+  onConfirm: () => void;
+}) {
+  return (
+    <AlertDialog>
+      <AlertDialogTrigger asChild>
+        <Button size="sm" variant="outline" className={className}>
+          {icon}
+          {label}
+        </Button>
+      </AlertDialogTrigger>
+      <AlertDialogContent className="border-zinc-800 bg-zinc-900 text-zinc-100">
+        <AlertDialogHeader>
+          <AlertDialogTitle>{title}</AlertDialogTitle>
+          <AlertDialogDescription>{description}</AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Annuler</AlertDialogCancel>
+          <AlertDialogAction onClick={onConfirm}>{confirmLabel}</AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
 
 type Overview = {
   users: number;
@@ -219,14 +271,15 @@ export function AdminView() {
                 >
                   <Check className="mr-1 h-3.5 w-3.5" /> Approuver &amp; publier
                 </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
+                <ConfirmButton
+                  label="Bloquer"
+                  icon={<Ban className="mr-1 h-3.5 w-3.5" />}
                   className="border-rose-500/40 text-rose-400"
-                  onClick={() => moderate.mutate({ trackId: item.track.id, outcome: "TAKEDOWN" })}
-                >
-                  <Ban className="mr-1 h-3.5 w-3.5" /> Bloquer
-                </Button>
+                  title="Bloquer ce titre ?"
+                  description={`« ${item.track.title} » sera retiré de la diffusion publique (takedown).`}
+                  confirmLabel="Bloquer le titre"
+                  onConfirm={() => moderate.mutate({ trackId: item.track.id, outcome: "TAKEDOWN" })}
+                />
               </div>
             </div>
           ))}
@@ -252,9 +305,14 @@ export function AdminView() {
                   {p.status}
                 </Badge>
                 {p.status === "SUCCEEDED" && (
-                  <Button size="sm" variant="outline" className="border-rose-500/40 text-rose-400" onClick={() => refund.mutate(p.id)}>
-                    Rembourser
-                  </Button>
+                  <ConfirmButton
+                    label="Rembourser"
+                    className="border-rose-500/40 text-rose-400"
+                    title="Rembourser ce paiement ?"
+                    description={`Le client sera remboursé de ${formatCDF(Number(p.amountMinor))} et l'accès premium associé sera révoqué immédiatement.`}
+                    confirmLabel="Confirmer le remboursement"
+                    onConfirm={() => refund.mutate(p.id)}
+                  />
                 )}
               </div>
             </div>
@@ -333,9 +391,15 @@ export function AdminView() {
                       </Button>
                     )}
                     {payout.status === "SENT" && (
-                      <Button size="sm" className="h-7 bg-emerald-600 hover:bg-emerald-500" onClick={() => royaltyAction.mutate({ action: "PAYOUT_TRANSITION", payoutId: payout.id, transition: "CONFIRM" })}>
-                        <Check className="mr-1 h-3 w-3" /> Confirmer réception
-                      </Button>
+                      <ConfirmButton
+                        label="Confirmer réception"
+                        icon={<Check className="mr-1 h-3 w-3" />}
+                        className="h-7 bg-emerald-600 hover:bg-emerald-500"
+                        title="Confirmer la réception des fonds ?"
+                        description={`Le payout ${payout.id.slice(-8)} sera marqué CONFIRMED — vérifiez la réception réelle sur le compte mobile money avant de confirmer.`}
+                        confirmLabel="Confirmer la réception"
+                        onConfirm={() => royaltyAction.mutate({ action: "PAYOUT_TRANSITION", payoutId: payout.id, transition: "CONFIRM" })}
+                      />
                     )}
                   </div>
                 </div>
@@ -387,9 +451,15 @@ export function AdminView() {
                   {u.status}
                 </Badge>
                 {u.status === "ACTIVE" ? (
-                  <Button size="sm" variant="outline" className="h-7 border-rose-500/40 text-rose-400" onClick={() => toggleUser.mutate({ userId: u.id, action: "SUSPEND" })}>
-                    <Pause className="mr-1 h-3 w-3" /> Suspendre
-                  </Button>
+                  <ConfirmButton
+                    label="Suspendre"
+                    icon={<Pause className="mr-1 h-3 w-3" />}
+                    className="h-7 border-rose-500/40 text-rose-400"
+                    title="Suspendre ce compte ?"
+                    description={`${u.displayName} perdra immédiatement l'accès (sessions révoquées).`}
+                    confirmLabel="Suspendre le compte"
+                    onConfirm={() => toggleUser.mutate({ userId: u.id, action: "SUSPEND" })}
+                  />
                 ) : (
                   <Button size="sm" variant="outline" className="h-7 border-emerald-500/40 text-emerald-400" onClick={() => toggleUser.mutate({ userId: u.id, action: "ACTIVATE" })}>
                     <RefreshCw className="mr-1 h-3 w-3" /> Réactiver

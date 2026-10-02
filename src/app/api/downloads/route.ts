@@ -18,7 +18,18 @@ export async function GET(req: Request) {
     const downloads = await db.download.findMany({
       where: { userId: user.id },
       orderBy: { updatedAt: "desc" },
-      include: { track: { include: { mainArtist: true, album: true } } },
+      include: {
+        track: {
+          include: {
+            mainArtist: true,
+            album: true,
+            audioAssets: {
+              where: { status: "READY" },
+              include: { variants: { where: { kind: "PROGRESSIVE_128K", status: "READY" }, take: 1 } },
+            },
+          },
+        },
+      },
     });
 
     const now = new Date();
@@ -37,7 +48,12 @@ export async function GET(req: Request) {
       }
       let freshUrl: string | null = null;
       if (!expired && d.status === "READY" && d.trackId === refreshTrackId) {
-        freshUrl = signStreamUrl(`audio/${d.trackId}/progressive.wav`, DOWNLOAD_URL_TTL_SECONDS);
+        // Clé RÉELLE en base (même source que le POST) : plus de reconstruction
+        // de convention de chemin qui peut dévier du stockage réel.
+        const variant = d.track.audioAssets.flatMap((a) => a.variants)[0];
+        freshUrl = variant
+          ? signStreamUrl(variant.storageKey, DOWNLOAD_URL_TTL_SECONDS)
+          : null;
       }
       items.push({
         id: d.id,

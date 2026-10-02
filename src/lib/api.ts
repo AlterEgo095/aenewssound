@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { ExternalProviderError } from "@/lib/external/types";
 
 export class ApiError extends Error {
   constructor(
@@ -26,6 +27,14 @@ export async function handle(
         { status: e.status }
       );
     }
+    // Erreurs de fournisseurs externes : statut HTTP sémantique (503 désactivé,
+    // 404 introuvable, 429 rate limit…) au lieu d'un 500 générique.
+    if (e instanceof ExternalProviderError) {
+      return NextResponse.json(
+        { error: e.message, code: "EXTERNAL_PROVIDER", provider: e.kind },
+        { status: e.status ?? 502 }
+      );
+    }
     console.error("[api]", e);
     return NextResponse.json({ error: "Erreur interne du serveur" }, { status: 500 });
   }
@@ -46,7 +55,12 @@ export function rateLimit(key: string, limit: number, windowMs: number) {
   const now = Date.now();
   const bucket = buckets.get(key);
   if (!bucket || bucket.reset < now) {
-    if (buckets.size > 10_000) buckets.clear();
+    // Purge sélective des buckets expirés (jamais de clear() global : il
+    // réinitialiserait les compteurs de brute force en cours).
+    if (buckets.size > 10_000) {
+      for (const [k, b] of buckets) if (b.reset < now) buckets.delete(k);
+      if (buckets.size > 10_000) buckets.clear(); // dernier recours sous saturation
+    }
     buckets.set(key, { count: 1, reset: now + windowMs });
     return;
   }
