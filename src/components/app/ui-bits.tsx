@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Heart, ListPlus, MoreVertical, Play, Download, UserRound } from "lucide-react";
+import { Heart, ListPlus, MoreVertical, Play, Download, UserRound, Youtube as YoutubeIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -9,6 +9,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { useToast } from "@/hooks/use-toast";
 import { api, ApiClientError } from "@/lib/api-client";
 import { usePlayerStore, useViewStore, type AlbumDTO, type ArtistDTO, type TrackDTO } from "@/lib/stores";
+import { useYoutubeStore } from "@/lib/youtube-store";
 import { cn } from "@/lib/utils";
 
 export function formatDuration(seconds: number): string {
@@ -150,6 +151,11 @@ export function TrackRow({
     }
   };
 
+  const playYoutube = () =>
+    void useYoutubeStore
+      .getState()
+      .playTrack({ id: track.id, title: track.title, artistName: track.artist.name });
+
   return (
     <div
       className={cn(
@@ -195,6 +201,9 @@ export function TrackRow({
             <Download className="mr-2 h-4 w-4" /> Télécharger (premium)
           </DropdownMenuItem>
           <DropdownMenuSeparator className="bg-zinc-800" />
+          <DropdownMenuItem onClick={playYoutube}>
+            <YoutubeIcon className="mr-2 h-4 w-4" /> Écouter sur YouTube (privé)
+          </DropdownMenuItem>
           <DropdownMenuItem onClick={() => openDetail({ kind: "artist", id: track.artist.id })}>
             <UserRound className="mr-2 h-4 w-4" /> Voir l&apos;artiste
           </DropdownMenuItem>

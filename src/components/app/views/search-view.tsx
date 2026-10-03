@@ -2,9 +2,10 @@
 
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ExternalLink, Link2, Search as SearchIcon } from "lucide-react";
+import { ExternalLink, Link2, Search as SearchIcon, Youtube as YoutubeIcon } from "lucide-react";
 import { api } from "@/lib/api-client";
 import { useViewStore, type AlbumDTO, type ArtistDTO, type TrackDTO } from "@/lib/stores";
+import { useYoutubeStore } from "@/lib/youtube-store";
 import { AlbumCardGrid, ArtistCardList, SectionHeader, TrackRow } from "@/components/app/ui-bits";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -231,13 +232,25 @@ export function SearchView() {
                   linked={t.linkedAenews}
                   sandbox={external.data!.sandbox}
                   onOpenLinked={
-                    t.linkedAenews!.entityType === "TRACK"
-                      ? undefined
-                      : () =>
+                    t.linkedAenews && t.linkedAenews.entityType !== "TRACK"
+                      ? () =>
                           openDetail({
                             kind: t.linkedAenews!.entityType === "ARTIST" ? "artist" : "album",
                             id: t.linkedAenews!.entityId,
                           })
+                      : undefined
+                  }
+                  onPlayYoutube={
+                    t.artistName
+                      ? () =>
+                          void useYoutubeStore
+                            .getState()
+                            .playQuery(`${t.artistName} ${t.title}`, {
+                              id: "", // lecture éphémère : pas de lien catalogue pour un résultat externe
+                              title: t.title,
+                              artistName: t.artistName ?? "",
+                            })
+                      : undefined
                   }
                 />
               ))}
@@ -266,6 +279,7 @@ function ExternalRow({
   linked,
   sandbox,
   onOpenLinked,
+  onPlayYoutube,
 }: {
   kind: string;
   title: string;
@@ -274,6 +288,7 @@ function ExternalRow({
   linked: LinkedAenews | null;
   sandbox: boolean;
   onOpenLinked?: () => void;
+  onPlayYoutube?: () => void;
 }) {
   return (
     <div className="flex items-center justify-between gap-3 rounded-xl border border-zinc-800 bg-zinc-900/40 px-3 py-2.5">
@@ -301,6 +316,15 @@ function ExternalRow({
             className="flex items-center gap-1 rounded-lg border border-emerald-500/40 px-2 py-1 text-[11px] font-semibold text-emerald-400 hover:bg-emerald-500/10"
           >
             <Link2 className="h-3 w-3" /> Lié AENEWS
+          </button>
+        )}
+        {onPlayYoutube && (
+          <button
+            onClick={onPlayYoutube}
+            aria-label={`Écouter ${title} sur YouTube (lecture privée)`}
+            className="flex items-center gap-1 rounded-lg border border-red-500/40 px-2 py-1 text-[11px] font-semibold text-red-400 hover:bg-red-500/10"
+          >
+            <YoutubeIcon className="h-3 w-3" /> YouTube
           </button>
         )}
         {externalUrl && (

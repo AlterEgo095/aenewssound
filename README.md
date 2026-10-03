@@ -2,6 +2,8 @@
 
 **Plateforme de streaming audio souveraine pour la RDC** — moteur audio propriétaire, paiements mobile money, catalogue et droits gérés en propre, intégration externe multi-fournisseurs (Spotify en premier).
 
+> **MODE PRIVÉ (décision produit en cours)** : la plateforme est déployée en **usage strictement personnel** — aucun utilisateur tiers, aucun partage d'URL, aucune monétisation. Dans ce cadre, un **lecteur YouTube intégré** (« voie B ») permet d'écouter des versions YouTube des titres du catalogue ; voir [Mode privé — lecteur YouTube](#mode-privé--lecteur-youtube-intégré-voie-b). Toute réouverture au public implique de reprendre les contraintes commerciales complètes (licences, droits, royalties).
+
 > Deux règles structurent toute la plateforme :
 >
 > 1. **Paiement ≠ Droit** — un paiement réussi ne confère rien par lui-même ; seul un `Entitlement` créé par le webhook donne accès, et l'accès effectif = `max(expiresAt)` des entitlements actifs cumulables.
@@ -16,9 +18,10 @@
 - [Structure du dépôt](#structure-du-dépôt)
 - [Démarrage rapide](#démarrage-rapide)
 - [Variables d'environnement](#variables-denvironnement)
-- [Comptes de démonstration](#comptes-de-démonstration)
+- [Comptes (usage privé)](#comptes-usage-privé)
 - [Scripts d'exploitation](#scripts-dexploitation)
 - [Intégration Spotify (multi-fournisseurs)](#intégration-spotify-multi-fournisseurs)
+- [Mode privé — lecteur YouTube intégré (« voie B »)](#mode-privé--lecteur-youtube-intégré-voie-b)
 - [Composants sandbox ↔ production](#composants-sandbox--production)
 - [Sécurité — invariants appliqués](#sécurité--invariants-appliqués)
 - [Feuille de route](#feuille-de-route)
@@ -38,6 +41,7 @@
 | **Royalties** | Ledger append-only (`ENTRY` / `REVERSAL` auto-référencé), splits en basis points, périodes, payouts (`APPROVE → SEND → CONFIRM → PAID`), statements JSON |
 | **Administration** | Vue d'ensemble, modération, utilisateurs, feature flags, paiements + remboursements, fraudes, royalties + ledger + payouts, sources externes |
 | **Fournisseurs externes** | Architecture `ExternalProvider` multi-fournisseurs : recherche, import contrôlé (jamais aveugle), identités externes anti-doublon, worker de sync non destructif, connexions utilisateur OAuth chiffrées |
+| **Lecteur YouTube privé** | « Voie B » (usage strictement personnel) : résolution titre → version YouTube (lien mémorisé ou recherche automatique), lecteur **officiel** visible intégré, sélecteur de version, mutual exclusion avec le lecteur AENEWS — **hors royalties** |
 
 ## Stack technique
 
@@ -77,7 +81,9 @@
 │       │   ├── cache.ts     #   TTL différenciés (artiste 24h / album 12h / titre 6h / search 5min)
 │       │   ├── rate-limit.ts#   seau à jetons
 │       │   ├── crypto.ts    #   AES-256-GCM (tokens utilisateurs jamais en clair)
-│       │   └── spotify/     #   api / catalog / mapper / connection / sandbox IDENTIFIÉ
+│       │   ├── spotify/     #   api / catalog / mapper / connection / sandbox IDENTIFIÉ
+│       │   └── youtube/     #   LECTEUR PRIVÉ (voie B) : api (Data v3) + private-player
+│       ├── youtube-store.ts # état du lecteur YouTube + mutual exclusion
 │       └── ...
 ├── scripts/                 # ops : royalty-check, royalty-reset, spotify-token-check
 ├── tests/                   # harness sandbox
@@ -109,18 +115,19 @@ Toutes les secrets passent par l'environnement — **jamais dans le code, jamais
 | `SPOTIFY_CLIENT_ID` | Identifiant de l'app Spotify Developer | optionnel — déclenche le client réel |
 | `SPOTIFY_CLIENT_SECRET` | Secret de l'app Spotify (jamais exposé au frontend) | optionnel — idem |
 | `SPOTIFY_REDIRECT_URI` | Callback OAuth utilisateur (`https://<domaine>/api/external/connections/spotify/callback`) | optionnel (fallback : origine de la requête) |
+| `YOUTUBE_API_KEY` | Clé API Google Cloud (YouTube Data API v3) pour le lecteur privé | optionnel — active la « voie B » |
 
 **Sans credentials Spotify**, le registre installe automatiquement `SandboxSpotifyProvider` — clairement identifié (`sandbox: true`, badges visibles dans l'UI). Avec credentials, il bascule sur le client réel sans aucun changement de code.
 
-## Comptes de démonstration
+**Sans `YOUTUBE_API_KEY`**, le lecteur privé reste désactivé : les routes renvoient un 503 explicite, l'UI affiche la raison — **aucune donnée simulée**.
 
-Créés par le seed (à changer avant toute exposition publique) :
+## Comptes (usage privé)
 
-| Téléphone | Mot de passe | Rôle |
-|---|---|---|
-| `+243000000001` | `admin-aenews-2024` | Administrateur |
-| `+243000000002` | `artiste-aenews-2024` | Artiste |
-| `+243000000003` | `ecoute-aenews-2024` | Auditeur |
+Les comptes sont créés par le seed (`bun run prisma/seed.ts`) avec des mots de passe **présents dans le code du seed** — donc connus de quiconque lit ce dépôt public. En usage privé sur un VPS exposé :
+
+1. **Connectez-vous en admin puis changez immédiatement les mots de passe** (ou supprimez les comptes de démonstration inutiles) ;
+2. Ne publiez jamais d'identifiants réels dans ce dépôt ;
+3. Toute réouverture à des utilisateurs tiers exige l'activation des politiques complètes (rate limits stricts, modération, CGU).
 
 ## Scripts d'exploitation
 
@@ -143,6 +150,31 @@ Spotify est la **première implémentation** du système `ExternalProvider` — 
 - **Sync non destructive** : la disparition temporaire d'une donnée chez Spotify ne supprime **jamais** une donnée AENEWS (jobs idempotents, reprises, observables).
 - **Connexions utilisateur** : Authorization Code + state HMAC (TTL 10 min) ; tokens chiffrés AES-256-GCM au repos ; jamais renvoyés au frontend.
 - **État actuel** : credentials validés (token réel obtenu) ; Spotify exige désormais un **abonnement Premium actif sur le compte propriétaire de l'app** pour servir l'API Web — bascule automatique quelques heures après souscription, mêmes credentials.
+
+## Mode privé — lecteur YouTube intégré (« voie B »)
+
+**Cadre : usage STRICTEMENT personnel.** Ce mode n'est légalement tenable que parce que la plateforme n'est ni partagée, ni indexée, ni monétisée. La frontière est binaire : dès qu'un seul utilisateur tiers accède (même gratuitement), on repasse en régime de communication au public et ce mode doit être désactivé (`YOUTUBE_API_KEY` retirée).
+
+**Fonctionnement** :
+
+- **Points d'entrée** : menu « ⋮ » de chaque titre → *Écouter sur YouTube (privé)* ; et bouton **YouTube** sur les résultats de recherche Spotify (lecture éphémère, sans lien catalogue).
+- **Résolution d'un titre** : 1) le lien mémorisé (identité externe `YOUTUBE_MUSIC`) s'il existe ; 2) sinon recherche automatique `« {artiste} {titre} audio »` via **YouTube Data API v3** (`videoEmbeddable=true`, catégorie Musique, durées récupérées pour filtrer les lives) → premier candidat joué et **mémorisé** pour les prochaines fois.
+- **Lecteur** : iframe **officielle** YouTube, toujours **visible** (jamais masquée — exigence CGU), contrôles natifs, vignette agrandissable, ouverture possible sur YouTube.
+- **Sélecteur de version** : dialog avec candidats + recherche libre ; un choix est mémorisé (réservé admin) et remplaçable à tout moment (dissociation sans destruction du titre).
+- **Mutual exclusion** : lancer YouTube met le lecteur AENEWS en pause et réciproquement — jamais deux audios simultanés.
+
+**Limites assumées** :
+
+- **Aucune écoute YouTube ne génère de `PlaybackEvent`, `ValidatedListening` ni `RoyaltyLine`** : le contenu n'est pas détenu par AENEWS — le ledger de royalties reste intègre (règle *Écoute ≠ Royalty*).
+- **Aucune extraction de flux** (`yt-dlp`, `ytdl-core`, …) : interdite par les CGU YouTube, en plus d'être techniquement fragile.
+- Le contenu YouTube peut disparaître ou changer d'adresse à tout moment : le sélecteur permet de re-lier ; le catalogue AENEWS n'est jamais touché.
+- Quota API gratuit : ~100 recherches/jour (100 unités/recherche, 10 000/jour) — cache mémoire 30 min + rate limits locaux intégrés.
+
+**Activation** :
+
+1. `console.cloud.google.com` → créer un projet → activer **YouTube Data API v3** ;
+2. Identifiants → **Clé API** → restreindre : API YouTube Data v3 uniquement + restriction par **IP du VPS** ;
+3. Renseigner `YOUTUBE_API_KEY` dans `.env` puis redémarrer — le registre passe `YOUTUBE_MUSIC` à « activé » (rôle `PRIVATE_PLAYBACK`, visible dans Admin → Sources externes).
 
 ## Composants sandbox ↔ production
 
@@ -174,7 +206,9 @@ Chaque substitut sandbox est **explicitement identifié** dans l'UI et les donn�
 - [x] Chaîne verticale complète : Auth → Entitlements → Paiements → Catalogue → Lecture → Fraude → Royalties → Admin
 - [x] Architecture `ExternalProvider` + Spotify (sandbox identifié / réel prêt)
 - [x] Frontend mobile-first (player, waveforms, offline flag, admin, sources externes)
+- [x] Mode privé « voie B » : lecteur YouTube intégré (Data API v3 + Iframe officielle, hors royalties)
 - [ ] Activation Spotify réel (Premium owner) + quota étendu si besoin
+- [ ] Clé `YOUTUBE_API_KEY` (Google Cloud) pour activer le lecteur privé en production
 - [ ] Migration **PostgreSQL 15+** + partitionnement mensuel `PlaybackEvent` automatisé
 - [ ] Passerelles mobile money réelles (matrix de tests paiements/webhooks/entitlements)
 - [ ] Pipeline audio production (R2/CDN/HLS + validation master)
@@ -183,4 +217,4 @@ Chaque substitut sandbox est **explicitement identifié** dans l'UI et les donn�
 
 ---
 
-© AENEWS — projet propriétaire. Les données Spotify restent la propriété de leurs détenteurs ; aucun contenu audio externe n'est stocké ni re-diffusé.
+© AENEWS — projet propriétaire. Les données Spotify/YouTube restent la propriété de leurs détenteurs ; aucun contenu audio externe n'est stocké par AENEWS, et la lecture YouTube passe exclusivement par le lecteur officiel, en usage privé.

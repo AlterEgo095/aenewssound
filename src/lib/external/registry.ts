@@ -14,6 +14,7 @@ import { ExternalProviderError, isProviderKind, type ExternalCatalogProvider, ty
 import { spotifyCredentialsFromEnv, SpotifyApiClient } from "./spotify/api";
 import { SpotifyCatalogProvider } from "./spotify/catalog";
 import { SandboxSpotifyProvider } from "./spotify/sandbox";
+import { youtubeApiKeyFromEnv } from "./youtube/api";
 
 export const PROVIDER_DISPLAY_NAMES: Record<ProviderKind, string> = {
   SPOTIFY: "Spotify",
@@ -46,7 +47,26 @@ export async function ensureProviderConfigs() {
       settings: JSON.stringify({ defaultSearchTypes: ["ARTIST", "ALBUM", "TRACK"] }),
     },
   });
-  for (const kind of ["APPLE_MUSIC", "YOUTUBE_MUSIC", "DEEZER", "AUDIOMACK"] as const) {
+  // YOUTUBE_MUSIC : PAS un fournisseur de catalogue — c'est le LECTEUR PRIVÉ
+  // (décision produit « voie B », usage strictement personnel). Actif
+  // uniquement si YOUTUBE_API_KEY est présente ; le statut reflète l'env à
+  // chaque démarrage (idempotent).
+  const hasYoutubeKey = youtubeApiKeyFromEnv() !== null;
+  await db.externalProviderConfig.upsert({
+    where: { provider: "YOUTUBE_MUSIC" },
+    update: { enabled: hasYoutubeKey, sandbox: false },
+    create: {
+      provider: "YOUTUBE_MUSIC",
+      displayName: "YouTube (lecteur privé)",
+      enabled: hasYoutubeKey,
+      sandbox: false,
+      settings: JSON.stringify({
+        role: "PRIVATE_PLAYBACK",
+        note: "Lecteur officiel YouTube intégré — usage strictement privé, hors royalties",
+      }),
+    },
+  });
+  for (const kind of ["APPLE_MUSIC", "DEEZER", "AUDIOMACK"] as const) {
     await db.externalProviderConfig.upsert({
       where: { provider: kind },
       update: {},
@@ -93,6 +113,14 @@ export async function getCatalogProvider(provider: ProviderKind): Promise<{
       creds !== null
         ? new SpotifyCatalogProvider(new SpotifyApiClient(creds))
         : new SandboxSpotifyProvider();
+  } else if (provider === "YOUTUBE_MUSIC") {
+    // Le lecteur privé YouTube n'est PAS un fournisseur de catalogue
+    // (métadonnées artiste/album/titre) — voir src/lib/external/youtube/.
+    throw new ExternalProviderError(
+      "YouTube est configuré comme lecteur privé uniquement (pas un fournisseur de catalogue) — utilisez /api/external/youtube/*",
+      provider,
+      501
+    );
   } else {
     // Fournisseurs futurs : brancher ici leur adaptateur (Apple Music…).
     // Aucun adaptateur simulé caché : on refuse explicitement.

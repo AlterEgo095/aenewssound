@@ -6,6 +6,7 @@ import { Disc3, Home, LibraryBig, Search, ShieldCheck, UserRound, Wallet } from 
 import { api } from "@/lib/api-client";
 import { ensureDeviceId, useAuthStore, useViewStore, type MeResponse, type Tab } from "@/lib/stores";
 import { PlayerProvider, MiniPlayer, FullPlayer } from "@/components/app/player";
+import { YoutubeMiniPlayer } from "@/components/app/youtube-player";
 import { AuthView } from "@/components/app/views/auth-view";
 import { HomeView } from "@/components/app/views/home-view";
 import { SearchView } from "@/components/app/views/search-view";
@@ -113,9 +114,10 @@ export function AppShell() {
               AENEWS SOUND — plateforme audio distribuée · streaming adaptatif · offline premium · mobile money
             </footer>
 
-            {/* MiniPlayer persistant : ancré au-dessus de la nav sticky, visible
-                pendant le scroll (contrôle principal de l'app musique). */}
+            {/* Lecteurs persistants : YouTube (privé, s'il est actif) au-dessus
+                du MiniPlayer AENEWS — ancrés au-dessus de la nav sticky. */}
             <div className="sticky bottom-[calc(3.25rem+env(safe-area-inset-bottom))] z-20">
+              <YoutubeMiniPlayer />
               <MiniPlayer />
             </div>
             <FullPlayer />
